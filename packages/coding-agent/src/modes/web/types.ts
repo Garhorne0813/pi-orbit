@@ -1,0 +1,93 @@
+import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
+
+/**
+ * Types for the web mode REST API and WebSocket protocol.
+ */
+
+/** Options passed to runWebMode */
+export interface WebModeOptions {
+	/** HTTP server port (default: 3000 or PI_WEB_PORT env var) */
+	port?: number;
+	/** HTTP server host (default: 127.0.0.1 or PI_WEB_HOST env var) */
+	host?: string;
+	/** Bearer token for API authentication (default: PI_WEB_AUTH_TOKEN env var) */
+	authToken?: string;
+}
+
+/** Session summary returned by list endpoints */
+export interface SessionSummary {
+	id: string;
+	name: string | undefined;
+	cwd: string;
+	createdAt: number;
+	model: string | undefined;
+}
+
+/** Create session request body */
+export interface CreateSessionRequest {
+	cwd?: string;
+	name?: string;
+}
+
+/** Create session response */
+export interface CreateSessionResponse {
+	sessionId: string;
+}
+
+/** Prompt request body */
+export interface PromptRequest {
+	message: string;
+}
+
+/** Bash command request body */
+export interface BashRequest {
+	command: string;
+}
+
+/** Fork session request body */
+export interface ForkRequest {
+	entryId?: string;
+}
+
+/** Set model request body */
+export interface SetModelRequest {
+	modelId: string;
+}
+
+/** Set thinking level request body */
+export interface SetThinkingRequest {
+	level: string;
+}
+
+/** Health check response */
+export interface HealthResponse {
+	status: "ok";
+	version: string;
+}
+
+/** API error response */
+export interface ApiError {
+	error: string;
+	details?: string;
+}
+
+/** In-memory session entry managed by the web mode */
+export interface WebSessionEntry {
+	runtime: AgentSessionRuntime;
+	createdAt: number;
+	/** True for the default session seeded at startup (not disposable via DELETE) */
+	system?: boolean;
+}
+
+/** Command sent from WebSocket client to server */
+export interface WsClientCommand {
+	type: "prompt";
+	message: string;
+}
+
+/** Type guard for WS client commands */
+export function isWsClientCommand(data: unknown): data is WsClientCommand {
+	if (typeof data !== "object" || data === null) return false;
+	const obj = data as Record<string, unknown>;
+	return obj.type === "prompt" && typeof obj.message === "string";
+}

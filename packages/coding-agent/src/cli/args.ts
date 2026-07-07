@@ -7,7 +7,7 @@ import chalk from "chalk";
 import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR } from "../config.ts";
 import type { ExtensionFlag } from "../core/extensions/types.ts";
 
-export type Mode = "text" | "json" | "rpc";
+export type Mode = "text" | "json" | "rpc" | "web";
 
 export interface Args {
 	provider?: string;
@@ -27,6 +27,12 @@ export interface Args {
 	sessionId?: string;
 	fork?: string;
 	sessionDir?: string;
+	/** Web mode port (--port) */
+	port?: number;
+	/** Web mode host (--host) */
+	host?: string;
+	/** Web mode auth token (--auth-token) */
+	authToken?: string;
 	models?: string[];
 	tools?: string[];
 	excludeTools?: string[];
@@ -77,7 +83,7 @@ export function parseArgs(args: string[]): Args {
 			result.version = true;
 		} else if (arg === "--mode" && i + 1 < args.length) {
 			const mode = args[++i];
-			if (mode === "text" || mode === "json" || mode === "rpc") {
+			if (mode === "text" || mode === "json" || mode === "rpc" || mode === "web") {
 				result.mode = mode;
 			}
 		} else if (arg === "--continue" || arg === "-c") {
@@ -177,6 +183,20 @@ export function parseArgs(args: string[]): Args {
 			}
 		} else if (arg === "--verbose") {
 			result.verbose = true;
+		} else if (arg === "--port" && i + 1 < args.length) {
+			const portStr = args[++i];
+			const port = Number(portStr);
+			if (Number.isInteger(port) && port > 0 && port <= 65535 && String(port) === portStr) {
+				result.port = port;
+			} else {
+				result.diagnostics.push({ type: "error", message: `Invalid port: ${portStr}` });
+			}
+		} else if (arg === "--port") {
+			result.diagnostics.push({ type: "error", message: "--port requires a value (e.g. --port 3000)" });
+		} else if (arg === "--host" && i + 1 < args.length) {
+			result.host = args[++i];
+		} else if (arg === "--auth-token" && i + 1 < args.length) {
+			result.authToken = args[++i];
 		} else if (arg === "--approve" || arg === "-a") {
 			result.projectTrustOverride = true;
 		} else if (arg === "--no-approve" || arg === "-na") {
@@ -240,7 +260,7 @@ ${chalk.bold("Options:")}
   --api-key <key>                API key (defaults to env vars)
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
-  --mode <mode>                  Output mode: text (default), json, or rpc
+  --mode <mode>                  Output mode: text (default), json, rpc, or web
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
@@ -274,12 +294,19 @@ ${chalk.bold("Options:")}
   --approve, -a                  Trust project-local files for this run
   --no-approve, -na              Ignore project-local files for this run
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
+  --port <port>                  Web mode: HTTP server port (default: 3000)
+  --host <host>                  Web mode: HTTP server host (default: 127.0.0.1)
+  --auth-token <token>           Web mode: Bearer token for API auth (env: PI_WEB_AUTH_TOKEN)
   --help, -h                     Show this help
   --version, -v                  Show version number
 
 Extensions can register additional flags (e.g., --plan from plan-mode extension).${extensionFlagsText}
 
 ${chalk.bold("Examples:")}
+  # Web mode (HTTP + WebSocket server)
+  ${APP_NAME} --mode web --port 3000
+  ${APP_NAME} --mode web --port 3000 --auth-token my-secret-token
+
   # Interactive mode
   ${APP_NAME}
 

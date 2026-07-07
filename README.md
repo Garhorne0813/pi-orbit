@@ -14,7 +14,7 @@
 
 This is the home of the Pi agent harness project including our self extensible coding agent.
 
-* **[@earendil-works/pi-coding-agent](packages/coding-agent)**: Interactive coding agent CLI
+* **[@earendil-works/pi-coding-agent](packages/coding-agent)**: Interactive coding agent CLI — TUI, print, JSON, RPC, and web modes
 * **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management
 * **[@earendil-works/pi-ai](packages/ai)**: Unified multi-provider LLM API (OpenAI, Anthropic, Google, …)
 
@@ -29,10 +29,47 @@ To learn more about Pi:
 |---------|-------------|
 | **[@earendil-works/pi-ai](packages/ai)** | Unified multi-provider LLM API (OpenAI, Anthropic, Google, etc.) |
 | **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
-| **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
+| **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI with TUI, JSON, RPC, and web modes |
 | **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
 
 For Slack/chat automation and workflows see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
+
+## Run Modes
+
+Pi supports five run modes, selectable via `--mode`:
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| **Interactive** (default) | `--mode text` | Full TUI with session management, themes, extensions, keybindings |
+| **Print** | `--mode text -p` | Non-interactive. Process a prompt and exit, write last assistant message to stdout |
+| **JSON** | `--mode json` | Like print but outputs session events as JSON lines on stdout |
+| **RPC** | `--mode rpc` | Headless JSON-Line protocol over stdin/stdout for IDE/tool integration. See [rpc.md](packages/coding-agent/docs/rpc.md) |
+| **Web** | `--mode web` | HTTP server with REST API + WebSocket streaming for browser clients and SaaS deployments. See [web-mode.md](packages/coding-agent/docs/web-mode.md) |
+
+### Web Mode Quick Start
+
+```bash
+# Start the web server
+pi --mode web --port 3000
+
+# In another terminal:
+# Health check
+curl http://localhost:3000/api/health
+
+# Create a session and send a prompt
+SESSION=$(curl -s -X POST http://localhost:3000/api/sessions \
+  -H "Content-Type: application/json" \
+  -d '{}' | python3 -c "import sys,json; print(json.load(sys.stdin)['sessionId'])")
+
+curl -X POST "http://localhost:3000/api/sessions/$SESSION/prompt" \
+  -H "Content-Type: application/json" \
+  -d '{"message": "List all .ts files"}'
+
+# Stream events via WebSocket
+websocat "ws://localhost:3000/ws?session_id=$SESSION"
+```
+
+See [packages/coding-agent/docs/web-mode.md](packages/coding-agent/docs/web-mode.md) for the full API reference.
 
 ## Permissions & Containerization
 
