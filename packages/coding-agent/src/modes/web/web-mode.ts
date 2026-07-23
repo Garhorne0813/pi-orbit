@@ -1,105 +1,120 @@
-/**
- * Web mode: HTTP + WebSocket server for the coding agent.
- *
- * Provides REST API for session management, prompting, model selection,
- * and WebSocket streaming of AgentSessionEvent.
- *
- * Usage: pi --mode web [--port 3000] [--host 127.0.0.1] [--auth-token <token>]
- */
+/** Web mode process adapter. */
 
-import type { AgentSessionRuntime, CreateAgentSessionRuntimeFactory } from "../../core/agent-session-runtime.ts";
-import type { ModelRegistry } from "../../core/model-registry.ts";
-import type { SessionManager } from "../../core/session-manager.ts";
-import type { SettingsManager } from "../../core/settings-manager.ts";
-import { createApp, createHttpServer } from "./server.ts";
-import type { WebModeOptions, WebSessionEntry } from "./types.ts";
+import {
+	type AgentSessionRuntime,
+	type CreateAgentSessionRuntimeFactory,
+	createAgentSessionRuntime,
+} from "../../core/agent-session-runtime.ts";
+import { SessionManager } from "../../core/session-manager.ts";
+import { WebAccessPolicy } from "./middleware/auth.ts";
+import { createApp, WebServerHost } from "./server.ts";
+import type { WebModeOptions } from "./types.ts";
+import { WebSessionHost, type WebSessionManagerFactory } from "./web-session-host.ts";
+import { ConnectionManager } from "./ws/connection-manager.ts";
 
 export interface RunWebModeOptions extends WebModeOptions {
 	factory: CreateAgentSessionRuntimeFactory;
-	sessionManager: SessionManager;
-	modelRegistry: ModelRegistry;
-	settingsManager: SettingsManager;
 	agentDir: string;
+	createSessionManager?: WebSessionManagerFactory;
 }
 
-/**
- * Run the coding agent in web mode.
- */
+export interface ResolvedWebModeOptions {
+	port: number;
+	host: string;
+	authToken: string | undefined;
+}
+
+export function resolveWebModeOptions(
+	options: WebModeOptions,
+	environment: NodeJS.ProcessEnv = process.env,
+): ResolvedWebModeOptions {
+	const rawPort = options.port ?? Number(environment.PI_WEB_PORT ?? "3000");
+	if (!Number.isInteger(rawPort) || rawPort < 1 || rawPort > 65535) {
+		throw new Error(`Invalid web port: ${environment.PI_WEB_PORT ?? String(rawPort)}`);
+	}
+	const rawToken = options.authToken ?? environment.PI_WEB_AUTH_TOKEN;
+	return {
+		port: rawPort,
+		host: options.host ?? environment.PI_WEB_HOST ?? "127.0.0.1",
+		authToken: rawToken && rawToken.length > 0 ? rawToken : undefined,
+	};
+}
+
 export async function runWebMode(defaultRuntime: AgentSessionRuntime, options: RunWebModeOptions): Promise<never> {
-	const {
-		port = parseInt(process.env.PI_WEB_PORT ?? "3000", 10),
-		host = process.env.PI_WEB_HOST ?? "127.0.0.1",
-		authToken,
-		factory,
-		sessionManager,
-		modelRegistry,
-		settingsManager,
-		agentDir,
-	} = options;
-
-	const sessionMap = new Map<string, WebSessionEntry>();
-
-	const { app, connectionManager } = createApp({
-		authToken,
-		sessionMap,
-		sessionRoutesDeps: {
-			sessionMap,
-			factory,
-			agentDir,
-			defaultRuntime,
-			sessionManager,
-			settingsManager,
-			modelRegistry,
-		},
-		modelRegistry,
+	const config = resolveWebModeOptions(options);
+	const connectionManager = new ConnectionManager();
+	const defaultSessionManager = defaultRuntime.session.sessionManager;
+	const createSessionManager =
+		options.createSessionManager ??
+		((cwd: string) =>
+			defaultSessionManager.isPersisted()
+				? SessionManager.create(cwd, defaultSessionManager.getSessionDir())
+				: SessionManager.inMemory(cwd));
+	const sessionHost = new WebSessionHost({
+		defaultRuntime,
+		connectionManager,
+		createSessionManager,
+		createRuntime: (cwd, sessionManager) =>
+			createAgentSessionRuntime(options.factory, {
+				cwd,
+				agentDir: options.agentDir,
+				sessionManager,
+			}),
 	});
+	await sessionHost.initialize();
 
-	const server = createHttpServer(app, sessionMap, connectionManager, authToken);
-
-	// Graceful shutdown
+	const accessPolicy = new WebAccessPolicy(config.authToken);
+	const serverHost = new WebServerHost(createApp({ sessionHost, connectionManager, accessPolicy }));
 	let shuttingDown = false;
-	const cleanup = async () => {
+	let removeServerErrorHandler = () => {};
+	const signalHandlers = new Map<NodeJS.Signals, () => void>();
+	const cleanup = async (exitCode: number): Promise<void> => {
 		if (shuttingDown) return;
 		shuttingDown = true;
-		console.error(`\n[web] Shutting down...`);
-		for (const [id] of sessionMap) {
-			connectionManager.removeSession(id);
-		}
-		await Promise.all(
-			[...sessionMap.values()].map((entry) =>
-				Promise.resolve(entry.runtime.dispose()).catch(() => {
-					// Ignore disposal errors
-				}),
-			),
-		);
-		server.close();
-		process.exit(0);
+		removeServerErrorHandler();
+		for (const [signal, handler] of signalHandlers) process.off(signal, handler);
+		console.error("\n[web] Shutting down...");
+		await serverHost.close();
+		await sessionHost.dispose();
+		process.exit(exitCode);
 	};
+	const requestCleanup = (exitCode: number): void => {
+		void cleanup(exitCode).catch((error: unknown) => {
+			console.error("[web] Shutdown error:", error);
+			process.exit(1);
+		});
+	};
+	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+		const handler = () => requestCleanup(0);
+		signalHandlers.set(signal, handler);
+		process.on(signal, handler);
+	}
 
-	process.on("SIGINT", cleanup);
-	process.on("SIGTERM", cleanup);
-	process.on("SIGHUP", cleanup);
-
-	// Handle both startup and runtime server errors
-	server.on("error", (err: NodeJS.ErrnoException) => {
-		if (err.code === "EADDRINUSE") {
-			console.error(`[web] Port ${port} is already in use. Use --port to specify a different port.`);
+	try {
+		const address = await serverHost.start(config.port, config.host);
+		removeServerErrorHandler = serverHost.onError((error) => {
+			console.error(`[web] Server error: ${error.message}`);
+			requestCleanup(1);
+		});
+		console.error(`[web] Pi web server listening on http://${config.host}:${address.port}`);
+		console.error(`[web] WebSocket endpoint: ws://${config.host}:${address.port}/ws`);
+		console.error(`[web] Health check: http://${config.host}:${address.port}/api/health`);
+		if (!accessPolicy.authenticationEnabled) {
+			console.error("[web] Warning: No auth token configured. API is open to all connections.");
+			console.error("[web] Set --auth-token or PI_WEB_AUTH_TOKEN to enable authentication.");
+		}
+	} catch (error) {
+		for (const [signal, handler] of signalHandlers) process.off(signal, handler);
+		await serverHost.close();
+		await sessionHost.dispose();
+		const serverError = error as NodeJS.ErrnoException;
+		if (serverError.code === "EADDRINUSE") {
+			console.error(`[web] Port ${config.port} is already in use. Use --port to specify a different port.`);
 		} else {
-			console.error(`[web] Server error: ${err.message}`);
+			console.error(`[web] Server error: ${serverError.message}`);
 		}
 		process.exit(1);
-	});
+	}
 
-	return new Promise<never>((_resolve, reject) => {
-		server.listen(port, host, () => {
-			console.error(`[web] Pi web server listening on http://${host}:${port}`);
-			console.error(`[web] WebSocket endpoint: ws://${host}:${port}/ws`);
-			console.error(`[web] Health check: http://${host}:${port}/api/health`);
-			if (!authToken) {
-				console.error(`[web] Warning: No auth token configured. API is open to all connections.`);
-				console.error(`[web] Set --auth-token or PI_WEB_AUTH_TOKEN to enable authentication.`);
-			}
-		});
-		server.once("error", reject);
-	});
+	return new Promise<never>(() => {});
 }

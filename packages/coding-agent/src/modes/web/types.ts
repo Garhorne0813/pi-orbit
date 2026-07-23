@@ -89,5 +89,42 @@ export interface WsClientCommand {
 export function isWsClientCommand(data: unknown): data is WsClientCommand {
 	if (typeof data !== "object" || data === null) return false;
 	const obj = data as Record<string, unknown>;
-	return obj.type === "prompt" && typeof obj.message === "string";
+	return obj.type === "prompt" && typeof obj.message === "string" && obj.message.length > 0;
+}
+
+export function isCreateSessionRequest(data: unknown): data is CreateSessionRequest {
+	if (typeof data !== "object" || data === null) return false;
+	const object = data as Record<string, unknown>;
+	return (
+		(object.cwd === undefined || typeof object.cwd === "string") &&
+		(object.name === undefined || typeof object.name === "string")
+	);
+}
+
+export function isPromptRequest(data: unknown): data is PromptRequest {
+	return hasNonEmptyString(data, "message");
+}
+
+export function isBashRequest(data: unknown): data is BashRequest {
+	return hasNonEmptyString(data, "command");
+}
+
+export function isForkRequest(data: unknown): data is ForkRequest {
+	if (typeof data !== "object" || data === null) return false;
+	const object = data as Record<string, unknown>;
+	return object.entryId === undefined || typeof object.entryId === "string";
+}
+
+export function isSetModelRequest(data: unknown): data is SetModelRequest {
+	return hasNonEmptyString(data, "modelId");
+}
+
+export function isSetThinkingRequest(data: unknown): data is SetThinkingRequest {
+	return hasNonEmptyString(data, "level");
+}
+
+function hasNonEmptyString(data: unknown, key: string): boolean {
+	if (typeof data !== "object" || data === null) return false;
+	const value = (data as Record<string, unknown>)[key];
+	return typeof value === "string" && value.length > 0;
 }

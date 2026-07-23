@@ -1,0 +1,98 @@
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { isValidThinkingLevel } from "../../cli/args.ts";
+import type { WebSessionHost } from "./web-session-host.ts";
+
+export type WebCommand =
+	| { type: "prompt"; message: string }
+	| { type: "abort" }
+	| { type: "bash"; command: string }
+	| { type: "compact" }
+	| { type: "fork"; entryId?: string }
+	| { type: "set_model"; modelId: string }
+	| { type: "set_thinking"; level: string };
+
+export class WebCommandError extends Error {
+	readonly status: 400 | 404 | 500;
+	readonly details: string | undefined;
+
+	constructor(message: string, status: 400 | 404 | 500, details?: string) {
+		super(message);
+		this.name = "WebCommandError";
+		this.status = status;
+		this.details = details;
+	}
+}
+
+export class WebCommandHandler {
+	private readonly sessionHost: WebSessionHost;
+	private readonly onBackgroundError: (message: string, error: unknown) => void;
+
+	constructor(sessionHost: WebSessionHost, onBackgroundError?: (message: string, error: unknown) => void) {
+		this.sessionHost = sessionHost;
+		this.onBackgroundError = onBackgroundError ?? ((message, error) => console.error(`[web] ${message}:`, error));
+	}
+
+	async execute(sessionId: string, command: WebCommand): Promise<Record<string, unknown>> {
+		const entry = this.sessionHost.get(sessionId);
+		if (!entry) throw new WebCommandError("Session not found", 404);
+		const runtime = entry.runtime;
+
+		try {
+			switch (command.type) {
+				case "prompt":
+					void runtime.session
+						.prompt(command.message)
+						.catch((error: unknown) => this.onBackgroundError(`Session ${sessionId} prompt failed`, error));
+					return { accepted: true };
+				case "abort":
+					runtime.session.abort();
+					return { success: true };
+				case "bash":
+					await runtime.session.executeBash(command.command);
+					return { success: true };
+				case "compact":
+					await runtime.session.compact();
+					return { success: true };
+				case "fork": {
+					let targetEntryId = command.entryId;
+					if (!targetEntryId) {
+						const firstUserEntry = runtime.session.sessionManager
+							.getEntries()
+							.find((entry) => entry.type === "message" && entry.message.role === "user");
+						targetEntryId = firstUserEntry?.id;
+					}
+					if (!targetEntryId) throw new WebCommandError("No entry to fork from", 400);
+					const result = await runtime.fork(targetEntryId);
+					return result.cancelled
+						? { success: false, reason: "cancelled" }
+						: { success: true, selectedText: result.selectedText };
+				}
+				case "set_model": {
+					const model = runtime.services.modelRegistry
+						.getAll()
+						.find(
+							(candidate: Model<Api>) =>
+								candidate.id === command.modelId || candidate.id.startsWith(command.modelId),
+						);
+					if (!model) throw new WebCommandError(`Model not found: ${command.modelId}`, 404);
+					await runtime.session.setModel(model);
+					return { success: true, model: model.id };
+				}
+				case "set_thinking":
+					if (!isValidThinkingLevel(command.level)) {
+						throw new WebCommandError(
+							"Invalid thinking level",
+							400,
+							"Must be one of: off, minimal, low, medium, high, xhigh",
+						);
+					}
+					runtime.session.setThinkingLevel(command.level);
+					return { success: true, level: command.level };
+			}
+		} catch (error) {
+			if (error instanceof WebCommandError) throw error;
+			const details = error instanceof Error ? error.message : String(error);
+			throw new WebCommandError(`Failed to execute ${command.type} command`, 500, details);
+		}
+	}
+}

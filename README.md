@@ -44,32 +44,35 @@ Pi supports five run modes, selectable via `--mode`:
 | **Print** | `--mode text -p` | Non-interactive. Process a prompt and exit, write last assistant message to stdout |
 | **JSON** | `--mode json` | Like print but outputs session events as JSON lines on stdout |
 | **RPC** | `--mode rpc` | Headless JSON-Line protocol over stdin/stdout for IDE/tool integration. See [rpc.md](packages/coding-agent/docs/rpc.md) |
-| **Web** | `--mode web` | HTTP server with REST API + WebSocket streaming for browser clients and SaaS deployments. See [web-mode.md](packages/coding-agent/docs/web-mode.md) |
+| **Web** | `--mode web` | HTTP server with REST APIs and WebSocket streaming for browser clients in one trust domain. See [web-mode.md](packages/coding-agent/docs/web-mode.md) |
 
 ### Web Mode Quick Start
 
 ```bash
-# Start the web server
-pi --mode web --port 3000
+# Terminal 1: start the web server with authentication
+PI_WEB_AUTH_TOKEN=my-secret-token pi --mode web --port 3000
 
-# In another terminal:
+# Terminal 2:
 # Health check
 curl http://localhost:3000/api/health
 
 # Create a session and send a prompt
 SESSION=$(curl -s -X POST http://localhost:3000/api/sessions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer my-secret-token" \
   -d '{}' | python3 -c "import sys,json; print(json.load(sys.stdin)['sessionId'])")
 
+# Connect before sending the prompt so no streaming events are missed
+websocat "ws://localhost:3000/ws?session_id=$SESSION&token=my-secret-token" &
+
+# Send a prompt. The API returns HTTP 202 immediately.
 curl -X POST "http://localhost:3000/api/sessions/$SESSION/prompt" \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer my-secret-token" \
   -d '{"message": "List all .ts files"}'
-
-# Stream events via WebSocket
-websocat "ws://localhost:3000/ws?session_id=$SESSION"
 ```
 
-See [packages/coding-agent/docs/web-mode.md](packages/coding-agent/docs/web-mode.md) for the full API reference.
+Each created Web session has an isolated session runtime, while the process-wide token grants access to every session in that process. Run separate processes or containers for mutually untrusted users. See [packages/coding-agent/docs/web-mode.md](packages/coding-agent/docs/web-mode.md) for the full API and deployment guidance.
 
 ## Permissions & Containerization
 

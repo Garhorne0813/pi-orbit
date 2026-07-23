@@ -1,103 +1,64 @@
-/**
- * Model and configuration routes for web mode.
- */
+/** Model and configuration routes for web mode. */
 
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { Hono } from "hono";
-import { isValidThinkingLevel } from "../../../cli/args.ts";
-import type { ModelRegistry } from "../../../core/model-registry.ts";
-import type { SetModelRequest, SetThinkingRequest, WebSessionEntry } from "../types.ts";
+import type { Context, Hono } from "hono";
+import { WebCommandError, type WebCommandHandler } from "../commands.ts";
+import { isSetModelRequest, isSetThinkingRequest } from "../types.ts";
+import type { WebSessionHost } from "../web-session-host.ts";
 
 export interface ModelRoutesDeps {
-	sessionMap: Map<string, WebSessionEntry>;
-	modelRegistry: ModelRegistry;
+	commands: WebCommandHandler;
+	sessionHost: WebSessionHost;
 }
 
 export function registerModelRoutes(app: Hono, deps: ModelRoutesDeps): void {
-	const { sessionMap, modelRegistry } = deps;
-
-	// GET /api/models — list available models
-	app.get("/api/models", (c) => {
-		const models = modelRegistry.getAll();
-		const modelList = models.map((m: Model<Api>) => ({
-			id: m.id,
-			name: m.name,
-			provider: m.provider,
-			reasoning: m.reasoning,
-			input: m.input,
-			contextWindow: m.contextWindow,
-			maxTokens: m.maxTokens,
-		}));
-		return c.json(modelList);
+	app.get("/api/models", (context) => {
+		const sessionId = context.req.query("session_id") ?? deps.sessionHost.defaultSessionId;
+		const entry = deps.sessionHost.get(sessionId);
+		if (!entry) return context.json({ error: "Session not found" } as const, 404);
+		return context.json(
+			entry.runtime.services.modelRegistry.getAll().map((model: Model<Api>) => ({
+				id: model.id,
+				name: model.name,
+				provider: model.provider,
+				reasoning: model.reasoning,
+				input: model.input,
+				contextWindow: model.contextWindow,
+				maxTokens: model.maxTokens,
+			})),
+		);
 	});
 
-	// POST /api/sessions/:id/model — set the model for a session
-	app.post("/api/sessions/:id/model", async (c) => {
-		const id = c.req.param("id");
-		const entry = sessionMap.get(id);
-		if (!entry) {
-			return c.json({ error: "Session not found" } as const, 404);
-		}
-
-		let body: SetModelRequest;
+	app.post("/api/sessions/:id/model", async (context) => {
+		let body: unknown;
 		try {
-			body = await c.req.json<SetModelRequest>();
+			body = await context.req.json();
 		} catch {
-			return c.json({ error: "Invalid JSON body" } as const, 400);
+			return context.json({ error: "Invalid JSON body" } as const, 400);
 		}
-
-		if (!body.modelId || typeof body.modelId !== "string") {
-			return c.json({ error: "Missing 'modelId' field" } as const, 400);
-		}
-
-		const models = modelRegistry.getAll();
-		const model = models.find((m: Model<Api>) => m.id === body.modelId || m.id.startsWith(body.modelId));
-		if (!model) {
-			return c.json({ error: `Model not found: ${body.modelId}` } as const, 404);
-		}
-
-		try {
-			await entry.runtime.session.setModel(model);
-			return c.json({ success: true, model: model.id });
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			return c.json({ error: "Failed to set model", details: message } as const, 500);
-		}
+		if (!isSetModelRequest(body)) return context.json({ error: "Missing 'modelId' field" } as const, 400);
+		return execute(context, () => deps.commands.execute(context.req.param("id"), { type: "set_model", ...body }));
 	});
 
-	// POST /api/sessions/:id/thinking — set thinking level
-	app.post("/api/sessions/:id/thinking", async (c) => {
-		const id = c.req.param("id");
-		const entry = sessionMap.get(id);
-		if (!entry) {
-			return c.json({ error: "Session not found" } as const, 404);
-		}
-
-		let body: SetThinkingRequest;
+	app.post("/api/sessions/:id/thinking", async (context) => {
+		let body: unknown;
 		try {
-			body = await c.req.json<SetThinkingRequest>();
+			body = await context.req.json();
 		} catch {
-			return c.json({ error: "Invalid JSON body" } as const, 400);
+			return context.json({ error: "Invalid JSON body" } as const, 400);
 		}
-
-		if (!body.level || !isValidThinkingLevel(body.level)) {
-			return c.json(
-				{
-					error: "Invalid thinking level",
-					details: "Must be one of: off, minimal, low, medium, high, xhigh",
-				} as const,
-				400,
-			);
-		}
-
-		try {
-			entry.runtime.session.setThinkingLevel(
-				body.level as Parameters<typeof entry.runtime.session.setThinkingLevel>[0],
-			);
-			return c.json({ success: true, level: body.level });
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			return c.json({ error: "Failed to set thinking level", details: message } as const, 500);
-		}
+		if (!isSetThinkingRequest(body)) return context.json({ error: "Missing 'level' field" } as const, 400);
+		return execute(context, () => deps.commands.execute(context.req.param("id"), { type: "set_thinking", ...body }));
 	});
+}
+
+async function execute(context: Context, command: () => Promise<Record<string, unknown>>) {
+	try {
+		return context.json(await command());
+	} catch (error) {
+		if (error instanceof WebCommandError) {
+			return context.json({ error: error.message, details: error.details }, error.status);
+		}
+		return context.json({ error: "Internal server error" } as const, 500);
+	}
 }

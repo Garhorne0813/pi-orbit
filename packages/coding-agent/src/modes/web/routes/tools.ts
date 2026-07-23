@@ -1,98 +1,48 @@
-/**
- * Tool and lifecycle routes for web mode.
- */
+/** Tool and lifecycle routes for web mode. */
 
-import type { Hono } from "hono";
-import type { BashRequest, ForkRequest, WebSessionEntry } from "../types.ts";
+import type { Context, Hono } from "hono";
+import { type WebCommand, WebCommandError, type WebCommandHandler } from "../commands.ts";
+import { isBashRequest, isForkRequest } from "../types.ts";
 
 export interface ToolRoutesDeps {
-	sessionMap: Map<string, WebSessionEntry>;
+	commands: WebCommandHandler;
 }
 
 export function registerToolRoutes(app: Hono, deps: ToolRoutesDeps): void {
-	const { sessionMap } = deps;
-
-	// POST /api/sessions/:id/bash — execute a ! command
-	app.post("/api/sessions/:id/bash", async (c) => {
-		const id = c.req.param("id");
-		const entry = sessionMap.get(id);
-		if (!entry) {
-			return c.json({ error: "Session not found" } as const, 404);
-		}
-
-		let body: BashRequest;
+	app.post("/api/sessions/:id/bash", async (context) => {
+		let body: unknown;
 		try {
-			body = await c.req.json<BashRequest>();
+			body = await context.req.json();
 		} catch {
-			return c.json({ error: "Invalid JSON body" } as const, 400);
+			return context.json({ error: "Invalid JSON body" } as const, 400);
 		}
-
-		if (!body.command || typeof body.command !== "string") {
-			return c.json({ error: "Missing 'command' field" } as const, 400);
-		}
-
-		try {
-			await entry.runtime.session.executeBash(body.command);
-			return c.json({ success: true });
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			return c.json({ error: "Failed to execute bash", details: message } as const, 500);
-		}
+		if (!isBashRequest(body)) return context.json({ error: "Missing 'command' field" } as const, 400);
+		return execute(context.req.param("id"), { type: "bash", ...body }, context, deps.commands);
 	});
 
-	// POST /api/sessions/:id/compact — trigger context compaction
-	app.post("/api/sessions/:id/compact", async (c) => {
-		const id = c.req.param("id");
-		const entry = sessionMap.get(id);
-		if (!entry) {
-			return c.json({ error: "Session not found" } as const, 404);
-		}
+	app.post("/api/sessions/:id/compact", (context) =>
+		execute(context.req.param("id"), { type: "compact" }, context, deps.commands),
+	);
 
+	app.post("/api/sessions/:id/fork", async (context) => {
+		let body: unknown = {};
 		try {
-			await entry.runtime.session.compact();
-			return c.json({ success: true });
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			return c.json({ error: "Failed to compact session", details: message } as const, 500);
-		}
-	});
-
-	// POST /api/sessions/:id/fork — fork the session
-	app.post("/api/sessions/:id/fork", async (c) => {
-		const id = c.req.param("id");
-		const entry = sessionMap.get(id);
-		if (!entry) {
-			return c.json({ error: "Session not found" } as const, 404);
-		}
-
-		let targetEntryId: string | undefined;
-		try {
-			const raw = await c.req.json<ForkRequest>();
-			targetEntryId = raw.entryId;
+			body = await context.req.json();
 		} catch {
-			// Body is optional for fork
+			// Fork body is optional.
 		}
-
-		// If no entryId provided, fork from the first user message
-		if (!targetEntryId) {
-			const entries = entry.runtime.session.sessionManager.getEntries();
-			const firstUserEntry = entries.find((e) => e.type === "message" && e.message.role === "user");
-			targetEntryId = firstUserEntry?.id;
-		}
-
-		if (!targetEntryId) {
-			return c.json({ error: "No entry to fork from" } as const, 400);
-		}
-
-		try {
-			const result = await entry.runtime.fork(targetEntryId);
-			if (result.cancelled) {
-				return c.json({ success: false, reason: "cancelled" });
-			}
-			return c.json({ success: true, selectedText: result.selectedText });
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			return c.json({ error: "Failed to fork session", details: message } as const, 500);
-		}
+		if (!isForkRequest(body)) return context.json({ error: "Invalid fork request" } as const, 400);
+		return execute(context.req.param("id"), { type: "fork", ...body }, context, deps.commands);
 	});
+}
+
+async function execute(sessionId: string, command: WebCommand, context: Context, commands: WebCommandHandler) {
+	try {
+		return context.json(await commands.execute(sessionId, command));
+	} catch (error) {
+		if (error instanceof WebCommandError) {
+			return context.json({ error: error.message, details: error.details }, error.status);
+		}
+		return context.json({ error: "Internal server error" } as const, 500);
+	}
 }

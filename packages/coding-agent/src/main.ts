@@ -816,10 +816,11 @@ export async function main(args: string[], options?: MainOptions) {
 			host: parsed.host,
 			authToken: parsed.authToken,
 			factory: createRuntime,
-			sessionManager,
-			modelRegistry,
-			settingsManager,
 			agentDir,
+			createSessionManager: (sessionCwd) =>
+				sessionManager.isPersisted()
+					? SessionManager.create(sessionCwd, sessionDir)
+					: SessionManager.inMemory(sessionCwd),
 		});
 	} else if (appMode === "interactive") {
 		const interactiveMode = new InteractiveMode(runtime, {

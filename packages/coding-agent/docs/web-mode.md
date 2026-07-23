@@ -1,6 +1,6 @@
 # Web Mode
 
-Web mode starts an HTTP + WebSocket server for the coding agent, enabling remote access, browser-based UIs, and multi-tenant SaaS deployments.
+Web mode starts an HTTP + WebSocket server for the coding agent, enabling remote access and browser-based UIs.
 
 ## Starting Web Mode
 
@@ -43,20 +43,20 @@ Web mode is a transport layer. All agent logic — prompting, tool execution, mo
 | Component | File | Role |
 |-----------|------|------|
 | `runWebMode()` | `modes/web/web-mode.ts` | Entry point. Creates HTTP server, manages lifecycle, handles signals. |
-| `createApp()` | `modes/web/server.ts` | Hono app setup — routes, CORS, auth middleware. |
-| `createHttpServer()` | `modes/web/server.ts` | Node.js HTTP server. Converts Node.js requests to Web `Request`, streams `Response` back. Handles WebSocket upgrades. |
-| `ConnectionManager` | `modes/web/ws/connection-manager.ts` | Per-session WebSocket fan-out. Subscribes to `AgentSession` events on first connection, broadcasts to all clients, unsubscribes on last disconnect. |
-| `registerSessionRoutes()` | `modes/web/routes/sessions.ts` | Session CRUD. Seeded with a default runtime session at startup; supports dynamic session creation via `POST /api/sessions`. |
-| `createAuthMiddleware()` | `modes/web/middleware/auth.ts` | Bearer token authentication. Uses constant-time comparison via `crypto.timingSafeEqual`. |
+| `WebServerHost` | `modes/web/server.ts` | Testable Node.js server lifecycle using the maintained Hono Node and `ws` adapters. |
+| `WebSessionHost` | `modes/web/web-session-host.ts` | Owns session creation, isolation, extension rebinding, deletion, and disposal. |
+| `WebCommandHandler` | `modes/web/commands.ts` | Shared command semantics for REST and WebSocket adapters. |
+| `ConnectionManager` | `modes/web/ws/connection-manager.ts` | Runtime-aware event fan-out that re-subscribes after the runtime replaces its session. |
+| `WebAccessPolicy` | `modes/web/middleware/auth.ts` | Shared HTTP and WebSocket authentication with constant-time token comparison. |
 
 ### Session Model
 
 Each session maps to a dedicated `AgentSessionRuntime` instance. The session lifecycle:
 
-1. **Default session**: Created at startup and seeded into the session map. Marked as `system: true` — DELETE will close its WebSocket connections but won't dispose the runtime (it's owned by the caller in `main.ts`).
-2. **Dynamic sessions**: Created via `POST /api/sessions`. Each gets its own `AgentSessionRuntime` created through the `CreateAgentSessionRuntimeFactory`. Extensions are bound in `"web"` mode.
-3. **Deletion**: `DELETE /api/sessions/:id` closes all WebSocket connections, removes the entry from the session map, and disposes the runtime (except for system sessions).
-4. **WebSocket lifecycle**: Connecting via `ws://host:port/ws?session_id=<id>` subscribes to that session's `AgentSessionEvent` stream. Disconnecting unsubscribes. Multiple clients can connect to the same session — events are fanned out to all.
+1. **Default session**: Created at startup and seeded into the session host. It cannot be deleted through the API.
+2. **Dynamic sessions**: Created via `POST /api/sessions`. Each gets its own `SessionManager` and `AgentSessionRuntime`. Extensions are bound in `"web"` mode.
+3. **Deletion**: `DELETE /api/sessions/:id` closes all WebSocket connections, removes the dynamic entry from the session host, and disposes its runtime.
+4. **WebSocket lifecycle**: Connecting via `ws://host:port/ws?session_id=<id>` subscribes to that runtime's current `AgentSessionEvent` stream. Fork, new-session, and switch-session operations atomically rebind the subscription. Multiple clients can connect to the same session.
 
 ## REST API
 
@@ -67,13 +67,13 @@ Each session maps to a dedicated `AgentSessionRuntime` instance. The session lif
 | `POST` | `/api/sessions` | Create a new session. Body: `{ "cwd": "/path", "name": "optional" }`. Returns `{ "sessionId": "uuid" }`. |
 | `GET` | `/api/sessions` | List all sessions. Returns `[{ id, name, cwd, createdAt, model }]`. |
 | `GET` | `/api/sessions/:id` | Get session details: name, cwd, model, thinkingLevel, messageCount. |
-| `DELETE` | `/api/sessions/:id` | Delete a session. Disposes the runtime and closes all WebSocket connections. System sessions are exempt from disposal. |
+| `DELETE` | `/api/sessions/:id` | Delete a dynamic session. The default session returns HTTP 403. |
 
 ### Agent Control
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/api/sessions/:id/prompt` | Send a prompt to the agent. Body: `{ "message": "..." }`. Returns immediately. Stream results via WebSocket. |
+| `POST` | `/api/sessions/:id/prompt` | Send a prompt to the agent. Body: `{ "message": "..." }`. Returns HTTP 202 immediately. Stream results via WebSocket. |
 | `POST` | `/api/sessions/:id/abort` | Abort the current agent run. |
 | `POST` | `/api/sessions/:id/bash` | Execute a `!` command. Body: `{ "command": "ls -la" }`. |
 | `POST` | `/api/sessions/:id/compact` | Trigger context compaction. |
@@ -83,7 +83,7 @@ Each session maps to a dedicated `AgentSessionRuntime` instance. The session lif
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/models` | List available models with id, name, provider, reasoning, input types, contextWindow, maxTokens. |
+| `GET` | `/api/models` | List models for the default session, or for `?session_id=<id>` when supplied. |
 | `POST` | `/api/sessions/:id/model` | Set the model for a session. Body: `{ "modelId": "claude-sonnet-5" }`. |
 | `POST` | `/api/sessions/:id/thinking` | Set thinking level. Body: `{ "level": "high" }`. Valid levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`. |
 
@@ -106,7 +106,7 @@ ws://host:port/ws?session_id=<uuid>[&token=<auth_token>]
 ```
 
 - `session_id` (required): The session to subscribe to.
-- `token` (required if auth is configured): Bearer token. Query param is used because browser WebSocket API does not support custom headers.
+- `token` (required if auth is configured): Bearer token. Query params may appear in proxy logs, so use TLS and configure proxies to redact request URLs. Browser WebSocket clients cannot set an Authorization header.
 
 ### Server → Client: Events
 
@@ -186,23 +186,18 @@ await fetch(`http://localhost:3000/api/sessions/${sessionId}/prompt`, {
 });
 ```
 
-## Multi-Tenant Deployment
+## Deployment Isolation
 
-For SaaS deployments serving multiple users:
+The built-in token is process-wide authentication, not tenant authorization. For deployments serving multiple users:
 
-1. **Per-tenant token**: Set `--auth-token` to a unique value per deployment. Extend `createAuthMiddleware()` for multi-tenant token validation (JWT, API key lookup, etc.).
-2. **Session isolation**: Each `POST /api/sessions` creates an isolated `AgentSessionRuntime`. Sessions don't share state.
+1. **Process isolation**: Run one Pi process or container per trust domain. Do not expose one process directly to mutually untrusted tenants.
+2. **Session isolation**: Each `POST /api/sessions` creates an isolated `SessionManager` and `AgentSessionRuntime` within that process.
 3. **Resource limits**: Monitor session count via `GET /api/sessions`. Implement rate limiting and session caps at the reverse proxy (nginx, Caddy) or in middleware.
 4. **Containerization**: Run each Pi instance in a container. See [containerization.md](containerization.md) for patterns.
 
 ## WebSocket Implementation
 
-WebSocket is implemented directly on Node.js `http.Server`'s `upgrade` event, without the `ws` npm package. Key details:
-
-- **Handshake**: `Sec-WebSocket-Key` → SHA-1 + GUID → Base64 → `Sec-WebSocket-Accept`
-- **Frame encoding**: FIN + opcode + mask. Supports payloads up to 64-bit lengths.
-- **Frame parsing**: Handles masked client frames, fragmented messages (continuation opcode 0x0), ping/pong, and TCP-level reassembly via internal buffer accumulation.
-- **Close**: Sends close frame (0x88) before destroying the socket.
+WebSocket upgrades and framing use `@hono/node-server` with `ws`. Web mode owns only authentication, session selection, command validation, and event fan-out.
 
 ## Limitations
 

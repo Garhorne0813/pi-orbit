@@ -10,36 +10,56 @@
  */
 
 import { timingSafeEqual } from "node:crypto";
-import type { Context, Next } from "hono";
+import type { MiddlewareHandler } from "hono";
 
-/** Create Hono middleware that validates Bearer token auth */
-export function createAuthMiddleware(authToken?: string) {
-	// Treat null/undefined/empty-string as "not configured" (open dev mode)
-	const rawToken = authToken ?? process.env.PI_WEB_AUTH_TOKEN ?? undefined;
-	const configuredToken = rawToken && rawToken.length > 0 ? rawToken : undefined;
+export class WebAccessPolicy {
+	private readonly configuredToken: string | undefined;
 
-	return async function authMiddleware(c: Context, next: Next): Promise<void> {
-		// Bypass auth only when no token is configured
-		if (configuredToken === undefined) {
+	constructor(authToken?: string) {
+		this.configuredToken = authToken && authToken.length > 0 ? authToken : undefined;
+	}
+
+	get authenticationEnabled(): boolean {
+		return this.configuredToken !== undefined;
+	}
+
+	createHttpMiddleware(): MiddlewareHandler {
+		return async (context, next) => {
+			if (!this.authenticationEnabled) {
+				await next();
+				return;
+			}
+
+			const authHeader = context.req.header("Authorization");
+			if (!authHeader || !authHeader.startsWith("Bearer ")) {
+				return context.json({ error: "Unauthorized", details: "Missing or invalid Authorization header" }, 401);
+			}
+			if (!this.matches(authHeader.slice(7))) {
+				return context.json({ error: "Unauthorized", details: "Invalid token" }, 401);
+			}
 			await next();
-			return;
-		}
+		};
+	}
 
-		const authHeader = c.req.header("Authorization");
-		if (!authHeader || !authHeader.startsWith("Bearer ")) {
-			c.json({ error: "Unauthorized", details: "Missing or invalid Authorization header" }, 401);
-			return;
-		}
+	createWebSocketMiddleware(): MiddlewareHandler {
+		return async (context, next) => {
+			if (!this.authenticationEnabled) {
+				await next();
+				return;
+			}
 
-		const providedToken = authHeader.slice(7);
-		// Constant-time comparison to prevent timing attacks
-		const a = Buffer.from(providedToken);
-		const b = Buffer.from(configuredToken);
-		if (a.length !== b.length || !timingSafeEqual(a, b)) {
-			c.json({ error: "Unauthorized", details: "Invalid token" }, 401);
-			return;
-		}
+			const token = context.req.query("token");
+			if (!token || !this.matches(token)) {
+				return context.json({ error: "Unauthorized", details: "Invalid token" }, 401);
+			}
+			await next();
+		};
+	}
 
-		await next();
-	};
+	private matches(providedToken: string): boolean {
+		if (!this.configuredToken) return true;
+		const provided = Buffer.from(providedToken);
+		const configured = Buffer.from(this.configuredToken);
+		return provided.length === configured.length && timingSafeEqual(provided, configured);
+	}
 }

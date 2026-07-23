@@ -16,7 +16,7 @@ Pi is a minimal terminal coding harness. Adapt pi to your workflows, not the oth
 
 Pi ships with powerful defaults but skips features like sub agents and plan mode. Instead, you can ask pi to build what you want or install a third party pi package that matches your workflow.
 
-Pi runs in four modes: interactive, print or JSON, RPC for process integration, and an SDK for embedding in your own apps. See [openclaw/openclaw](https://github.com/openclaw/openclaw) for a real-world SDK integration.
+Pi runs in five modes: interactive, print, JSON, RPC for process integration, and Web for HTTP/WebSocket clients. It also provides an SDK for embedding in your own apps. See [openclaw/openclaw](https://github.com/openclaw/openclaw) for a real-world SDK integration.
 
 ## Share your OSS coding agent sessions
 
@@ -55,6 +55,7 @@ I regularly publish my own `pi-mono` work sessions here:
   - [Themes](#themes)
   - [Pi Packages](#pi-packages)
 - [Programmatic Usage](#programmatic-usage)
+  - [Web Mode](#web-mode)
 - [Philosophy](#philosophy)
 - [CLI Reference](#cli-reference)
 
@@ -482,6 +483,16 @@ RPC mode uses strict LF-delimited JSONL framing. Clients must split records on `
 
 See [docs/rpc.md](docs/rpc.md) for the protocol.
 
+### Web Mode
+
+Web mode exposes isolated Pi sessions through REST APIs and streams `AgentSessionEvent` messages over WebSocket:
+
+```bash
+PI_WEB_AUTH_TOKEN=my-secret-token pi --mode web --port 3000
+```
+
+The process-wide token grants access to every session in that process. Use a separate process or container for each trust domain. See [docs/web-mode.md](docs/web-mode.md) for endpoints, WebSocket commands, examples, and deployment guidance.
+
 ---
 
 ## Philosophy
@@ -536,6 +547,7 @@ pi config                    # Enable/disable package resources
 | `-p`, `--print` | Print response and exit |
 | `--mode json` | Output all events as JSON lines (see [docs/json.md](docs/json.md)) |
 | `--mode rpc` | RPC mode for process integration (see [docs/rpc.md](docs/rpc.md)) |
+| `--mode web` | REST and WebSocket server (see [docs/web-mode.md](docs/web-mode.md)) |
 | `--export <in> [out]` | Export session to HTML |
 
 In print mode, pi also reads piped stdin and merges it into the initial prompt:
@@ -601,6 +613,9 @@ Combine `--no-*` with explicit flags to load exactly what you need, ignoring set
 | `--system-prompt <text>` | Replace default prompt (context files and skills still appended) |
 | `--append-system-prompt <text>` | Append to system prompt |
 | `--verbose` | Force verbose startup |
+| `--port <port>` | Web mode HTTP port (default: `3000`) |
+| `--host <host>` | Web mode bind address (default: `127.0.0.1`) |
+| `--auth-token <token>` | Web mode process-wide authentication token |
 | `-a`, `--approve` | Trust project-local files for this run |
 | `-na`, `--no-approve` | Ignore project-local files for this run |
 | `-h`, `--help` | Show help |
@@ -664,6 +679,9 @@ pi --thinking high "Solve this complex problem"
 | `PI_SKIP_VERSION_CHECK` | Skip the Pi version update check at startup. This prevents the `pi.dev` latest-version request |
 | `PI_TELEMETRY` | Override install/update telemetry and provider attribution headers. Use `1`/`true`/`yes` to enable or `0`/`false`/`no` to disable. This does not disable update checks |
 | `PI_CACHE_RETENTION` | Set to `long` for extended prompt cache (Anthropic: 1h, OpenAI: 24h) |
+| `PI_WEB_PORT` | Web mode HTTP port (default: `3000`) |
+| `PI_WEB_HOST` | Web mode bind address (default: `127.0.0.1`) |
+| `PI_WEB_AUTH_TOKEN` | Web mode process-wide authentication token |
 | `VISUAL`, `EDITOR` | Fallback external editor for Ctrl+G when `externalEditor` is unset; defaults to Notepad on Windows and `nano` elsewhere |
 
 ---

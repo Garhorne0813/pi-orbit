@@ -7,8 +7,13 @@
 - Added public SDK exports for CLI-equivalent model and scoped-model resolution ([#6201](https://github.com/earendil-works/pi/issues/6201)).
 - Added extension entry renderers for persisted display-only session entries that are rendered in interactive mode without being sent to the model context.
 
+### Changed
+
+- Replaced Web mode's hand-written Node.js HTTP and WebSocket protocol implementation with the maintained Hono Node and `ws` adapters.
+
 ### Fixed
 
+- Fixed Web mode session isolation, runtime replacement event rebinding, default-session deletion, session naming, authentication configuration, and prompt response semantics.
 - Fixed startup model selection to skip unauthenticated saved defaults so configured local custom models can be selected instead ([#6231](https://github.com/earendil-works/pi/issues/6231)).
 - Fixed the question extension example to run question tool calls sequentially so multiple questions in one assistant turn remain answerable ([#6189](https://github.com/earendil-works/pi/issues/6189)).
 - Fixed `/login` to report auth storage persistence failures instead of claiming credentials were saved when `auth.json` is locked ([#6223](https://github.com/earendil-works/pi/issues/6223)).
