@@ -17,7 +17,7 @@ export function registerModelRoutes(app: Hono, deps: ModelRoutesDeps): void {
 		const entry = deps.sessionHost.get(sessionId);
 		if (!entry) return context.json({ error: "Session not found" } as const, 404);
 		return context.json(
-			entry.runtime.services.modelRegistry.getAll().map((model: Model<Api>) => ({
+			entry.runtime.services.modelRuntime.getModels().map((model: Model<Api>) => ({
 				id: model.id,
 				name: model.name,
 				provider: model.provider,

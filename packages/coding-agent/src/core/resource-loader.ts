@@ -1,5 +1,5 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import chalk from "chalk";
 import { CONFIG_DIR_NAME } from "../config.ts";
 import { loadThemeFromPath, type Theme } from "../modes/interactive/theme/theme.ts";
@@ -70,6 +70,9 @@ function loadContextFileFromDir(dir: string): { path: string; content: string } 
 		const filePath = join(dir, filename);
 		if (existsSync(filePath)) {
 			try {
+				if (!statSync(filePath).isFile()) {
+					continue;
+				}
 				return {
 					path: filePath,
 					content: readFileSync(filePath, "utf-8"),
@@ -101,7 +104,6 @@ export function loadProjectContextFiles(options: {
 	const ancestorContextFiles: Array<{ path: string; content: string }> = [];
 
 	let currentDir = resolvedCwd;
-	const root = resolve("/");
 
 	while (true) {
 		const contextFile = loadContextFileFromDir(currentDir);
@@ -110,9 +112,7 @@ export function loadProjectContextFiles(options: {
 			seenPaths.add(contextFile.path);
 		}
 
-		if (currentDir === root) break;
-
-		const parentDir = resolve(currentDir, "..");
+		const parentDir = dirname(currentDir);
 		if (parentDir === currentDir) break;
 		currentDir = parentDir;
 	}
@@ -902,6 +902,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			const extensionPath = `<inline:${isNamed ? input.name : index + 1}>`;
 			try {
 				const extension = await loadExtensionFromFactory(factory, this.cwd, this.eventBus, runtime, extensionPath);
+				extension.hidden = isNamed && input.hidden;
 				extensions.push(extension);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : "failed to load extension";

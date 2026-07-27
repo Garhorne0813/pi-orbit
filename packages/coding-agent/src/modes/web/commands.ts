@@ -68,8 +68,8 @@ export class WebCommandHandler {
 						: { success: true, selectedText: result.selectedText };
 				}
 				case "set_model": {
-					const model = runtime.services.modelRegistry
-						.getAll()
+					const model = runtime.services.modelRuntime
+						.getModels()
 						.find(
 							(candidate: Model<Api>) =>
 								candidate.id === command.modelId || candidate.id.startsWith(command.modelId),

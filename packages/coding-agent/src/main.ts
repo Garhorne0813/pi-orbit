@@ -9,6 +9,15 @@ import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import chalk from "chalk";
 import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.ts";
+import {
+	type CredentialPrintCommand,
+	CredentialPrintError,
+	isCredentialPrintHelp,
+	parseCredentialPrintCommand,
+	printCredentialPrintHelp,
+	resolveCredentialForPrint,
+	validateCredentialPrintArgs,
+} from "./cli/credential-print.ts";
 import { processFileArguments } from "./cli/file-processor.ts";
 import { buildInitialMessage } from "./cli/initial-message.ts";
 import { listModels } from "./cli/list-models.ts";
@@ -23,12 +32,11 @@ import {
 	createAgentSessionServices,
 } from "./core/agent-session-services.ts";
 import { formatNoModelsAvailableMessage } from "./core/auth-guidance.ts";
-import { AuthStorage } from "./core/auth-storage.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
-import type { ModelRegistry } from "./core/model-registry.ts";
 import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
+import { ModelRuntime } from "./core/model-runtime.ts";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
 import type { CreateAgentSessionOptions } from "./core/sdk.ts";
@@ -42,6 +50,7 @@ import { assertValidSessionId, SessionManager } from "./core/session-manager.ts"
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
+import { builtInExtensions } from "./extensions/index.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode, runWebMode } from "./modes/index.ts";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
@@ -119,6 +128,45 @@ function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc" | "web"> {
 
 function isPlainRuntimeMetadataCommand(parsed: Args): boolean {
 	return !parsed.print && parsed.mode === undefined && (parsed.help === true || parsed.listModels !== undefined);
+}
+
+async function runCredentialPrintCommand(args: string[]): Promise<boolean> {
+	if (isCredentialPrintHelp(args)) {
+		printCredentialPrintHelp();
+		return true;
+	}
+
+	let command: CredentialPrintCommand | undefined;
+	try {
+		command = parseCredentialPrintCommand(args);
+	} catch (error) {
+		const message = error instanceof CredentialPrintError ? error.message : "Failed to parse auth command";
+		console.error(chalk.red(`Error: ${message}`));
+		process.exitCode = 1;
+		return true;
+	}
+	if (!command) return false;
+
+	const parsed = parseArgs(command.args);
+	if (parsed.diagnostics.length > 0) {
+		for (const diagnostic of parsed.diagnostics) {
+			console.error(chalk.red(`Error: ${diagnostic.message}`));
+		}
+		process.exitCode = 1;
+		return true;
+	}
+
+	try {
+		validateCredentialPrintArgs(parsed);
+		const modelRuntime = await ModelRuntime.create({ allowModelNetwork: false });
+		const credential = await resolveCredentialForPrint(parsed, modelRuntime, command.kind, command.minExpiryMs);
+		process.stdout.write(`${credential}\n`);
+	} catch (error) {
+		const message = error instanceof CredentialPrintError ? error.message : "Failed to resolve credential";
+		console.error(chalk.red(`Error: ${message}`));
+		process.exitCode = 1;
+	}
+	return true;
 }
 
 async function prepareInitialMessage(
@@ -347,6 +395,11 @@ async function createSessionManager(
 		if (existingSession) {
 			return SessionManager.open(existingSession.path, sessionDir);
 		}
+		console.error(
+			chalk.yellow(
+				`Warning: No project session found with id '${parsed.sessionId}'; creating a new session with that id.`,
+			),
+		);
 	}
 
 	return SessionManager.create(cwd, sessionDir, { id: parsed.sessionId });
@@ -356,7 +409,7 @@ function buildSessionOptions(
 	parsed: Args,
 	scopedModels: ScopedModel[],
 	hasExistingSession: boolean,
-	modelRegistry: ModelRegistry,
+	modelRuntime: ModelRuntime,
 	settingsManager: SettingsManager,
 ): {
 	options: CreateAgentSessionOptions;
@@ -375,7 +428,7 @@ function buildSessionOptions(
 			cliProvider: parsed.provider,
 			cliModel: parsed.model,
 			cliThinking: parsed.thinking,
-			modelRegistry,
+			modelRuntime,
 		});
 		if (resolved.warning) {
 			diagnostics.push({ type: "warning", message: resolved.warning });
@@ -398,7 +451,7 @@ function buildSessionOptions(
 		// Check if saved default is in scoped models - use it if so, otherwise first scoped model
 		const savedProvider = settingsManager.getDefaultProvider();
 		const savedModelId = settingsManager.getDefaultModel();
-		const savedModel = savedProvider && savedModelId ? modelRegistry.find(savedProvider, savedModelId) : undefined;
+		const savedModel = savedProvider && savedModelId ? modelRuntime.getModel(savedProvider, savedModelId) : undefined;
 		const savedInScope = savedModel ? scopedModels.find((sm) => modelsAreEqual(sm.model, savedModel)) : undefined;
 
 		if (savedInScope) {
@@ -431,7 +484,7 @@ function buildSessionOptions(
 		}));
 	}
 
-	// API key from CLI - set in authStorage
+	// API key from CLI - set as a non-persistent runtime override
 	// (handled by caller before createAgentSession)
 
 	// Tools
@@ -470,6 +523,7 @@ export interface MainOptions {
 
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
+	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
 		process.env.PI_OFFLINE = "1";
@@ -486,7 +540,7 @@ export async function main(args: string[], options?: MainOptions) {
 	applyHttpProxySettings(bootstrapSettingsManager.getGlobalSettings().httpProxy);
 	configureHttpDispatcher();
 
-	if (await handlePackageCommand(args, { extensionFactories: options?.extensionFactories })) {
+	if (await handlePackageCommand(args, { extensionFactories })) {
 		const exitCode = process.exitCode ?? 0;
 		if (process.platform === "win32" && exitCode === 0 && args[0] === "update") {
 			// We normally prefer process.exit(0) for package commands so bad extensions cannot keep
@@ -499,7 +553,11 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 
-	if (await handleConfigCommand(args, { extensionFactories: options?.extensionFactories })) {
+	if (await handleConfigCommand(args, { extensionFactories })) {
+		return;
+	}
+
+	if (await runCredentialPrintCommand(args)) {
 		return;
 	}
 
@@ -609,7 +667,6 @@ export async function main(args: string[], options?: MainOptions) {
 	const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
 	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
 	const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
-	const authStorage = AuthStorage.create();
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		cwd,
 		agentDir,
@@ -632,7 +689,6 @@ export async function main(args: string[], options?: MainOptions) {
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
-			authStorage,
 			settingsManager: runtimeSettingsManager,
 			extensionFlagValues: parsed.unknownFlags,
 			resourceLoaderReloadOptions: shouldResolveProjectTrust
@@ -671,10 +727,10 @@ export async function main(args: string[], options?: MainOptions) {
 				noContextFiles: parsed.noContextFiles,
 				systemPrompt: parsed.systemPrompt,
 				appendSystemPrompt: parsed.appendSystemPrompt,
-				extensionFactories: options?.extensionFactories,
+				extensionFactories,
 			},
 		});
-		const { settingsManager, modelRegistry, resourceLoader } = services;
+		const { settingsManager, modelRuntime, resourceLoader } = services;
 		const diagnostics: AgentSessionRuntimeDiagnostic[] = [
 			...projectTrustDiagnostics,
 			...services.diagnostics,
@@ -687,7 +743,7 @@ export async function main(args: string[], options?: MainOptions) {
 
 		const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
 		const scopedModels =
-			modelPatterns && modelPatterns.length > 0 ? await resolveModelScope(modelPatterns, modelRegistry) : [];
+			modelPatterns && modelPatterns.length > 0 ? await resolveModelScope(modelPatterns, modelRuntime) : [];
 		const {
 			options: sessionOptions,
 			cliThinkingFromModel,
@@ -696,7 +752,7 @@ export async function main(args: string[], options?: MainOptions) {
 			parsed,
 			scopedModels,
 			sessionManager.buildSessionContext().messages.length > 0,
-			modelRegistry,
+			modelRuntime,
 			settingsManager,
 		);
 		diagnostics.push(...sessionOptionDiagnostics);
@@ -708,7 +764,8 @@ export async function main(args: string[], options?: MainOptions) {
 					message: "--api-key requires a model to be specified via --model, --provider/--model, or --models",
 				});
 			} else {
-				authStorage.setRuntimeApiKey(sessionOptions.model.provider, parsed.apiKey);
+				await modelRuntime.setRuntimeApiKey(sessionOptions.model.provider, parsed.apiKey, { allowNetwork: false });
+				await services.modelRuntime.getAvailable();
 			}
 		}
 
@@ -743,7 +800,7 @@ export async function main(args: string[], options?: MainOptions) {
 	});
 	time("createAgentSessionRuntime");
 	const { services, session, modelFallbackMessage } = runtime;
-	const { settingsManager, modelRegistry, resourceLoader } = services;
+	const { settingsManager, modelRuntime, resourceLoader } = services;
 	applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy);
 	configureHttpDispatcher(settingsManager.getHttpIdleTimeoutMs());
 
@@ -757,7 +814,7 @@ export async function main(args: string[], options?: MainOptions) {
 
 	if (parsed.listModels !== undefined) {
 		const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
-		await listModels(modelRegistry, searchPattern);
+		await listModels(modelRuntime, searchPattern);
 		process.exit(0);
 	}
 
@@ -804,6 +861,11 @@ export async function main(args: string[], options?: MainOptions) {
 	if (startupBenchmark && appMode !== "interactive") {
 		console.error(chalk.red("Error: PI_STARTUP_BENCHMARK only supports interactive mode"));
 		process.exit(1);
+	}
+
+	// RPC refreshes catalogs here in the background; interactive mode starts its refresh after TUI initialization.
+	if (!offlineMode && appMode === "rpc") {
+		void modelRuntime.refresh().catch(() => {});
 	}
 
 	if (appMode === "rpc") {

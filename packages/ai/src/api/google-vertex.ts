@@ -35,8 +35,9 @@ import {
 	convertTools,
 	isThinkingPart,
 	mapStopReason,
-	mapToolChoice,
+	resolveGoogleFunctionCallingMode,
 	retainThoughtSignature,
+	supportsGoogleStrictToolSampling,
 } from "./google-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
@@ -87,7 +88,7 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 				totalTokens: 0,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
-			stopReason: "stop",
+			stopReason: "pending",
 			timestamp: Date.now(),
 		};
 
@@ -275,6 +276,9 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 				throw new Error("Request was aborted");
 			}
 
+			if (output.stopReason === "pending") {
+				throw new Error("Google Vertex stream ended without a finish reason");
+			}
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
 				throw new Error("An unknown error occurred");
 			}
@@ -454,21 +458,17 @@ function buildParams(
 		generationConfig.maxOutputTokens = options.maxTokens;
 	}
 
+	const functionCallingMode = context.tools?.length
+		? resolveGoogleFunctionCallingMode(context.tools, options.toolChoice, supportsGoogleStrictToolSampling(model.id))
+		: undefined;
 	const config: GenerateContentConfig = {
 		...(Object.keys(generationConfig).length > 0 && generationConfig),
 		...(context.systemPrompt && { systemInstruction: sanitizeSurrogates(context.systemPrompt) }),
 		...(context.tools && context.tools.length > 0 && { tools: convertTools(context.tools) }),
+		...(functionCallingMode !== undefined && {
+			toolConfig: { functionCallingConfig: { mode: functionCallingMode } },
+		}),
 	};
-
-	if (context.tools && context.tools.length > 0 && options.toolChoice) {
-		config.toolConfig = {
-			functionCallingConfig: {
-				mode: mapToolChoice(options.toolChoice),
-			},
-		};
-	} else {
-		config.toolConfig = undefined;
-	}
 
 	if (options.thinking?.enabled && model.reasoning) {
 		const thinkingConfig: ThinkingConfig = { includeThoughts: true };
@@ -498,7 +498,7 @@ function buildParams(
 	return params;
 }
 
-type ClampedThinkingLevel = Exclude<PiThinkingLevel, "xhigh">;
+type ClampedThinkingLevel = Exclude<PiThinkingLevel, "xhigh" | "max">;
 
 function isGemini3ProModel(model: Model<"google-generative-ai">): boolean {
 	return /gemini-3(?:\.\d+)?-pro/.test(model.id.toLowerCase());

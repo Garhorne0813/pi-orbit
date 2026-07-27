@@ -12,6 +12,7 @@ import {
 	createAgentSessionServices,
 } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
+import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { WebAccessPolicy } from "../src/modes/web/middleware/auth.ts";
 import { createApp, WebServerHost } from "../src/modes/web/server.ts";
@@ -32,7 +33,29 @@ describe("web mode server", () => {
 		const faux = registerFauxProvider();
 		faux.setResponses([fauxAssistantMessage("websocket response"), fauxAssistantMessage("http response")]);
 		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
+		await authStorage.modify(faux.getModel().provider, async () => ({ type: "api_key", key: "faux-key" }));
+		const modelRuntime = await ModelRuntime.create({
+			credentials: authStorage,
+			modelsPath: join(root, "models.json"),
+		});
+		const model = faux.getModel();
+		modelRuntime.registerProvider(model.provider, {
+			baseUrl: model.baseUrl,
+			api: model.api,
+			models: [
+				{
+					id: model.id,
+					name: model.name,
+					api: model.api,
+					reasoning: model.reasoning,
+					input: model.input,
+					cost: model.cost,
+					contextWindow: model.contextWindow,
+					maxTokens: model.maxTokens,
+					baseUrl: model.baseUrl,
+				},
+			],
+		});
 		const factory: CreateAgentSessionRuntimeFactory = async ({
 			cwd,
 			agentDir,
@@ -42,7 +65,7 @@ describe("web mode server", () => {
 			const services = await createAgentSessionServices({
 				cwd,
 				agentDir,
-				authStorage,
+				modelRuntime,
 				resourceLoaderOptions: {
 					noExtensions: true,
 					noSkills: true,
