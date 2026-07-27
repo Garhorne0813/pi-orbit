@@ -22,6 +22,7 @@ export interface ResolvedWebModeOptions {
 	port: number;
 	host: string;
 	authToken: string | undefined;
+	corsOrigin: string;
 }
 
 export function resolveWebModeOptions(
@@ -37,6 +38,7 @@ export function resolveWebModeOptions(
 		port: rawPort,
 		host: options.host ?? environment.PI_WEB_HOST ?? "127.0.0.1",
 		authToken: rawToken && rawToken.length > 0 ? rawToken : undefined,
+		corsOrigin: options.corsOrigin ?? environment.PI_WEB_CORS_ORIGIN ?? "*",
 	};
 }
 
@@ -64,7 +66,9 @@ export async function runWebMode(defaultRuntime: AgentSessionRuntime, options: R
 	await sessionHost.initialize();
 
 	const accessPolicy = new WebAccessPolicy(config.authToken);
-	const serverHost = new WebServerHost(createApp({ sessionHost, connectionManager, accessPolicy }));
+	const serverHost = new WebServerHost(
+		createApp({ sessionHost, connectionManager, accessPolicy, corsOrigin: config.corsOrigin }),
+	);
 	let shuttingDown = false;
 	let removeServerErrorHandler = () => {};
 	const signalHandlers = new Map<NodeJS.Signals, () => void>();

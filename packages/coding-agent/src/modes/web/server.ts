@@ -4,10 +4,12 @@ import type { AddressInfo } from "node:net";
 import { createAdaptorServer, upgradeWebSocket } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { WebSocketServer } from "ws";
+import { type WebSocket, WebSocketServer } from "ws";
 import { VERSION } from "../../config.ts";
 import { WebCommandError, WebCommandHandler } from "./commands.ts";
 import type { WebAccessPolicy } from "./middleware/auth.ts";
+import { createSessionRateLimit, type RateLimitOptions } from "./middleware/rate-limit.ts";
+import { registerEventRoutes } from "./routes/events.ts";
 import { registerModelRoutes } from "./routes/model.ts";
 import { registerPromptRoutes } from "./routes/prompt.ts";
 import { registerSessionRoutes } from "./routes/sessions.ts";
@@ -22,6 +24,8 @@ export interface CreateAppOptions {
 	connectionManager: ConnectionManager;
 	accessPolicy: WebAccessPolicy;
 	commands?: WebCommandHandler;
+	promptRateLimit?: RateLimitOptions;
+	corsOrigin?: string;
 }
 
 export function createApp(options: CreateAppOptions): Hono {
@@ -31,12 +35,21 @@ export function createApp(options: CreateAppOptions): Hono {
 
 	app.use(
 		"*",
-		cors({ origin: "*", allowHeaders: ["Content-Type", "Authorization"], allowMethods: ["GET", "POST", "DELETE"] }),
+		cors({
+			origin: options.corsOrigin ?? "*",
+			allowHeaders: ["Content-Type", "Authorization"],
+			allowMethods: ["GET", "POST", "PATCH", "DELETE"],
+		}),
 	);
 	app.get("/api/health", (context) => context.json<HealthResponse>({ status: "ok", version: VERSION }));
 	app.use("/api/*", accessPolicy.createHttpMiddleware());
 
 	registerSessionRoutes(app, { sessionHost });
+	registerEventRoutes(app, { sessionHost, connectionManager });
+	app.use(
+		"/api/sessions/:id/prompt",
+		createSessionRateLimit(options.promptRateLimit ?? { limit: 30, windowMs: 60_000 }),
+	);
 	registerPromptRoutes(app, { commands });
 	registerModelRoutes(app, { commands, sessionHost });
 	registerToolRoutes(app, { commands });
@@ -55,7 +68,11 @@ export function createApp(options: CreateAppOptions): Hono {
 			if (!sessionId) throw new Error("Validated WebSocket request is missing session_id");
 			return {
 				onOpen: (_event, websocket) => {
-					connectionManager.register(sessionId, websocket);
+					try {
+						connectionManager.register(sessionId, websocket);
+					} catch {
+						websocket.close(1011, "Session not available");
+					}
 				},
 				onMessage: (event, websocket) => {
 					if (typeof event.data !== "string") {
@@ -107,11 +124,19 @@ function formatWebSocketCommandError(error: unknown): Record<string, unknown> {
 export class WebServerHost {
 	private readonly websocketServer = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
 	private readonly server;
+	private readonly heartbeatIntervalMs: number;
+	private readonly responsiveClients = new WeakSet<WebSocket>();
 	private started = false;
 	private closing: Promise<void> | undefined;
+	private heartbeatTimer: NodeJS.Timeout | undefined;
 
-	constructor(app: Hono) {
+	constructor(app: Hono, options: { heartbeatIntervalMs?: number } = {}) {
 		this.server = createAdaptorServer({ fetch: app.fetch, websocket: { server: this.websocketServer } });
+		this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 30_000;
+		this.websocketServer.on("connection", (client) => {
+			this.responsiveClients.add(client);
+			client.on("pong", () => this.responsiveClients.add(client));
+		});
 	}
 
 	start(port: number, host: string): Promise<AddressInfo> {
@@ -130,6 +155,7 @@ export class WebServerHost {
 					reject(new Error("Web server did not expose a TCP address"));
 					return;
 				}
+				this.startHeartbeat();
 				resolve(address);
 			});
 		});
@@ -147,6 +173,10 @@ export class WebServerHost {
 	}
 
 	private async closeOnce(): Promise<void> {
+		if (this.heartbeatTimer) {
+			clearInterval(this.heartbeatTimer);
+			this.heartbeatTimer = undefined;
+		}
 		for (const client of this.websocketServer.clients) {
 			client.terminate();
 		}
@@ -156,5 +186,23 @@ export class WebServerHost {
 			});
 			this.started = false;
 		}
+	}
+
+	private startHeartbeat(): void {
+		this.heartbeatTimer = setInterval(() => {
+			for (const client of this.websocketServer.clients) {
+				if (!this.responsiveClients.has(client)) {
+					client.terminate();
+					continue;
+				}
+				this.responsiveClients.delete(client);
+				try {
+					client.ping();
+				} catch {
+					client.terminate();
+				}
+			}
+		}, this.heartbeatIntervalMs);
+		this.heartbeatTimer.unref();
 	}
 }

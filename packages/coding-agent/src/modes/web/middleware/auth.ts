@@ -9,7 +9,7 @@
  * An empty or missing token disables authentication (dev mode).
  */
 
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { MiddlewareHandler } from "hono";
 
 export class WebAccessPolicy {
@@ -48,7 +48,8 @@ export class WebAccessPolicy {
 				return;
 			}
 
-			const token = context.req.query("token");
+			const authHeader = context.req.header("Authorization");
+			const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
 			if (!token || !this.matches(token)) {
 				return context.json({ error: "Unauthorized", details: "Invalid token" }, 401);
 			}
@@ -58,8 +59,8 @@ export class WebAccessPolicy {
 
 	private matches(providedToken: string): boolean {
 		if (!this.configuredToken) return true;
-		const provided = Buffer.from(providedToken);
-		const configured = Buffer.from(this.configuredToken);
-		return provided.length === configured.length && timingSafeEqual(provided, configured);
+		const provided = createHash("sha256").update(providedToken).digest();
+		const configured = createHash("sha256").update(this.configuredToken).digest();
+		return timingSafeEqual(provided, configured);
 	}
 }

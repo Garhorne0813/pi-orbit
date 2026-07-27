@@ -11,7 +11,7 @@ import type { AgentSessionRuntime } from "../../../core/agent-session-runtime.ts
 /** Minimal WebSocket-like interface for sending messages */
 export interface WebSocketLike {
 	send(data: string): void;
-	close(): void;
+	close(code?: number, reason?: string): void;
 }
 
 /** Per-session WebSocket connection tracking */
@@ -107,6 +107,11 @@ export class ConnectionManager {
 				try {
 					client.send(message);
 				} catch {
+					try {
+						client.close(1011, "Event delivery failed");
+					} catch {
+						// Ignore close failures for already-broken connections.
+					}
 					connections.clients.delete(client);
 				}
 			}
