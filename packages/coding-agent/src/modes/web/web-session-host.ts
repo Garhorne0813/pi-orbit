@@ -98,6 +98,35 @@ export class WebSessionHost {
 		return "removed";
 	}
 
+	async restartSession(sessionId: string): Promise<"restarted" | "not_found"> {
+		const entry = this.entries.get(sessionId);
+		if (!entry) return "not_found";
+
+		const sessionManager = this.createSessionManager(entry.runtime.cwd);
+		const name = entry.runtime.session.sessionName;
+		if (name) sessionManager.appendSessionInfo(name);
+		const replacement = await this.createRuntime(entry.runtime.cwd, sessionManager);
+
+		this.connectionManager.removeSession(sessionId);
+		try {
+			await this.connectionManager.trackSession(sessionId, replacement, () =>
+				this.bindWebExtensions(replacement, sessionId),
+			);
+		} catch (error) {
+			await replacement.dispose().catch(() => {});
+			await this.connectionManager.trackSession(sessionId, entry.runtime, () =>
+				this.bindWebExtensions(entry.runtime, sessionId),
+			);
+			throw error;
+		}
+
+		this.entries.set(sessionId, { ...entry, runtime: replacement });
+		await entry.runtime.dispose().catch((error: unknown) => {
+			console.error(`[web] Session ${sessionId} restart cleanup failed:`, error);
+		});
+		return "restarted";
+	}
+
 	async dispose(): Promise<void> {
 		if (this.disposed) return;
 		this.disposed = true;

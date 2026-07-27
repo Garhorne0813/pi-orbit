@@ -12,6 +12,8 @@ export interface WebModeOptions {
 	host?: string;
 	/** Bearer token for API authentication (default: PI_WEB_AUTH_TOKEN env var) */
 	authToken?: string;
+	/** Allowed CORS origin (default: PI_WEB_CORS_ORIGIN env var or *) */
+	corsOrigin?: string;
 }
 
 /** Session summary returned by list endpoints */
@@ -51,12 +53,23 @@ export interface ForkRequest {
 
 /** Set model request body */
 export interface SetModelRequest {
+	provider: string;
 	modelId: string;
 }
 
 /** Set thinking level request body */
 export interface SetThinkingRequest {
 	level: string;
+}
+
+/** Rename session request body */
+export interface RenameSessionRequest {
+	name: string;
+}
+
+/** Export session request body */
+export interface ExportSessionRequest {
+	outputPath?: string;
 }
 
 /** Health check response */
@@ -116,11 +129,21 @@ export function isForkRequest(data: unknown): data is ForkRequest {
 }
 
 export function isSetModelRequest(data: unknown): data is SetModelRequest {
-	return hasNonEmptyString(data, "modelId");
+	return hasNonEmptyString(data, "provider") && hasNonEmptyString(data, "modelId");
 }
 
 export function isSetThinkingRequest(data: unknown): data is SetThinkingRequest {
 	return hasNonEmptyString(data, "level");
+}
+
+export function isRenameSessionRequest(data: unknown): data is RenameSessionRequest {
+	return hasNonEmptyString(data, "name");
+}
+
+export function isExportSessionRequest(data: unknown): data is ExportSessionRequest {
+	if (typeof data !== "object" || data === null) return false;
+	const object = data as Record<string, unknown>;
+	return object.outputPath === undefined || typeof object.outputPath === "string";
 }
 
 function hasNonEmptyString(data: unknown, key: string): boolean {

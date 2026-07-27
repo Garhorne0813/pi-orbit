@@ -1,8 +1,9 @@
 /** Tool and lifecycle routes for web mode. */
 
-import type { Context, Hono } from "hono";
-import { type WebCommand, WebCommandError, type WebCommandHandler } from "../commands.ts";
+import type { Hono } from "hono";
+import type { WebCommandHandler } from "../commands.ts";
 import { isBashRequest, isForkRequest } from "../types.ts";
+import { executeCommand } from "./utils.ts";
 
 export interface ToolRoutesDeps {
 	commands: WebCommandHandler;
@@ -17,11 +18,11 @@ export function registerToolRoutes(app: Hono, deps: ToolRoutesDeps): void {
 			return context.json({ error: "Invalid JSON body" } as const, 400);
 		}
 		if (!isBashRequest(body)) return context.json({ error: "Missing 'command' field" } as const, 400);
-		return execute(context.req.param("id"), { type: "bash", ...body }, context, deps.commands);
+		return executeCommand(context, () => deps.commands.execute(context.req.param("id"), { type: "bash", ...body }));
 	});
 
 	app.post("/api/sessions/:id/compact", (context) =>
-		execute(context.req.param("id"), { type: "compact" }, context, deps.commands),
+		executeCommand(context, () => deps.commands.execute(context.req.param("id"), { type: "compact" })),
 	);
 
 	app.post("/api/sessions/:id/fork", async (context) => {
@@ -32,17 +33,6 @@ export function registerToolRoutes(app: Hono, deps: ToolRoutesDeps): void {
 			// Fork body is optional.
 		}
 		if (!isForkRequest(body)) return context.json({ error: "Invalid fork request" } as const, 400);
-		return execute(context.req.param("id"), { type: "fork", ...body }, context, deps.commands);
+		return executeCommand(context, () => deps.commands.execute(context.req.param("id"), { type: "fork", ...body }));
 	});
-}
-
-async function execute(sessionId: string, command: WebCommand, context: Context, commands: WebCommandHandler) {
-	try {
-		return context.json(await commands.execute(sessionId, command));
-	} catch (error) {
-		if (error instanceof WebCommandError) {
-			return context.json({ error: error.message, details: error.details }, error.status);
-		}
-		return context.json({ error: "Internal server error" } as const, 500);
-	}
 }

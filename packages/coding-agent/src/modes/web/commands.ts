@@ -8,8 +8,8 @@ export type WebCommand =
 	| { type: "bash"; command: string }
 	| { type: "compact" }
 	| { type: "fork"; entryId?: string }
-	| { type: "set_model"; modelId: string }
-	| { type: "set_thinking"; level: string };
+	| { type: "set_model"; provider: string; modelId: string }
+	| { type: "set_thinking_level"; level: string };
 
 export class WebCommandError extends Error {
 	readonly status: 400 | 404 | 500;
@@ -40,19 +40,33 @@ export class WebCommandHandler {
 		try {
 			switch (command.type) {
 				case "prompt":
-					void runtime.session
-						.prompt(command.message)
-						.catch((error: unknown) => this.onBackgroundError(`Session ${sessionId} prompt failed`, error));
-					return { accepted: true };
+					await new Promise<void>((resolve, reject) => {
+						let preflightSucceeded = false;
+						void runtime.session
+							.prompt(command.message, {
+								preflightResult: (didSucceed) => {
+									if (didSucceed) {
+										preflightSucceeded = true;
+										resolve();
+									}
+								},
+							})
+							.catch((error: unknown) => {
+								if (preflightSucceeded) {
+									this.onBackgroundError(`Session ${sessionId} prompt failed`, error);
+								} else {
+									reject(error);
+								}
+							});
+					});
+					return { success: true };
 				case "abort":
 					runtime.session.abort();
 					return { success: true };
 				case "bash":
-					await runtime.session.executeBash(command.command);
-					return { success: true };
+					return { ...(await runtime.session.executeBash(command.command)) };
 				case "compact":
-					await runtime.session.compact();
-					return { success: true };
+					return { ...(await runtime.session.compact()) };
 				case "fork": {
 					let targetEntryId = command.entryId;
 					if (!targetEntryId) {
@@ -69,16 +83,16 @@ export class WebCommandHandler {
 				}
 				case "set_model": {
 					const model = runtime.services.modelRegistry
-						.getAll()
+						.getAvailable()
 						.find(
 							(candidate: Model<Api>) =>
-								candidate.id === command.modelId || candidate.id.startsWith(command.modelId),
+								candidate.provider === command.provider && candidate.id === command.modelId,
 						);
-					if (!model) throw new WebCommandError(`Model not found: ${command.modelId}`, 404);
+					if (!model) throw new WebCommandError(`Model not found: ${command.provider}/${command.modelId}`, 404);
 					await runtime.session.setModel(model);
 					return { success: true, model: model.id };
 				}
-				case "set_thinking":
+				case "set_thinking_level":
 					if (!isValidThinkingLevel(command.level)) {
 						throw new WebCommandError(
 							"Invalid thinking level",
