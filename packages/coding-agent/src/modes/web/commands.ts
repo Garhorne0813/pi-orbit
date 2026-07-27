@@ -82,12 +82,10 @@ export class WebCommandHandler {
 						: { success: true, selectedText: result.selectedText };
 				}
 				case "set_model": {
-					const model = runtime.services.modelRegistry
-						.getAvailable()
-						.find(
-							(candidate: Model<Api>) =>
-								candidate.provider === command.provider && candidate.id === command.modelId,
-						);
+					const model = (await runtime.services.modelRuntime.getAvailable()).find(
+						(candidate: Model<Api>) =>
+							candidate.provider === command.provider && candidate.id === command.modelId,
+					);
 					if (!model) throw new WebCommandError(`Model not found: ${command.provider}/${command.modelId}`, 404);
 					await runtime.session.setModel(model);
 					return { success: true, model: model.id };

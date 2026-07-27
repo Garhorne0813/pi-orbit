@@ -1,7 +1,14 @@
-import type { FileSystem, JsonlSessionMetadata, LeafEntry, SessionStorage, SessionTreeEntry } from "../types.ts";
+import { uuidv7 } from "@earendil-works/pi-ai";
+import type {
+	FileSystem,
+	JsonlSessionMetadata,
+	LeafEntry,
+	SessionEntryCursorOptions,
+	SessionStorage,
+	SessionTreeEntry,
+} from "../types.ts";
 import { SessionError, toError } from "../types.ts";
 import { getFileSystemResultOrThrow } from "./repo-utils.ts";
-import { uuidv7 } from "./uuid.ts";
 
 type JsonlSessionStorageFileSystem = Pick<FileSystem, "readTextFile" | "readTextLines" | "writeFile" | "appendFile">;
 
@@ -12,6 +19,7 @@ interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	metadata?: Record<string, unknown>;
 }
 
 function updateLabelCache(labelsById: Map<string, string>, entry: SessionTreeEntry): void {
@@ -75,6 +83,12 @@ function parseHeaderLine(line: string, filePath: string): SessionHeader {
 	if (header.parentSession !== undefined && typeof header.parentSession !== "string") {
 		throw invalidSession(filePath, "session header parentSession must be a string");
 	}
+	if (
+		header.metadata !== undefined &&
+		(typeof header.metadata !== "object" || header.metadata === null || Array.isArray(header.metadata))
+	) {
+		throw invalidSession(filePath, "session header metadata must be an object");
+	}
 	return {
 		type: "session",
 		version: 3,
@@ -82,6 +96,7 @@ function parseHeaderLine(line: string, filePath: string): SessionHeader {
 		timestamp: header.timestamp,
 		cwd: header.cwd,
 		parentSession: header.parentSession,
+		metadata: header.metadata,
 	};
 }
 
@@ -127,6 +142,7 @@ function headerToSessionMetadata(header: SessionHeader, path: string): JsonlSess
 		cwd: header.cwd,
 		path,
 		parentSessionPath: header.parentSession,
+		metadata: header.metadata,
 	};
 }
 
@@ -205,6 +221,7 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 			cwd: string;
 			sessionId: string;
 			parentSessionPath?: string;
+			metadata?: Record<string, unknown>;
 		},
 	): Promise<JsonlSessionStorage> {
 		const header: SessionHeader = {
@@ -214,6 +231,7 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 			timestamp: new Date().toISOString(),
 			cwd: options.cwd,
 			parentSession: options.parentSessionPath,
+			metadata: options.metadata,
 		};
 		getFileSystemResultOrThrow(
 			await fs.writeFile(filePath, `${JSON.stringify(header)}\n`),
@@ -282,13 +300,66 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		return this.labelsById.get(id);
 	}
 
-	async getPathToRoot(leafId: string | null): Promise<SessionTreeEntry[]> {
+	async getSessionName(): Promise<string | undefined> {
+		const entries = await this.findEntries("session_info");
+		return entries[entries.length - 1]?.name?.trim() || undefined;
+	}
+
+	async getSessionStats() {
+		let messageCount = 0;
+		let cachedTokens = 0;
+		let uncachedTokens = 0;
+		let totalTokens = 0;
+		let costTotal = 0;
+		for (const entry of this.entries) {
+			if (entry.type === "message") {
+				messageCount += 1;
+			}
+			const usage =
+				entry.type === "message"
+					? entry.message.role === "assistant"
+						? entry.message.usage
+						: undefined
+					: entry.type === "compaction" || entry.type === "branch_summary"
+						? entry.usage
+						: undefined;
+			if (
+				!usage ||
+				typeof usage.input !== "number" ||
+				typeof usage.output !== "number" ||
+				typeof usage.cacheRead !== "number" ||
+				typeof usage.cacheWrite !== "number" ||
+				typeof usage.cost?.total !== "number"
+			) {
+				continue;
+			}
+			cachedTokens += usage.cacheRead;
+			uncachedTokens += usage.input + usage.cacheWrite;
+			totalTokens += usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+			costTotal += usage.cost.total;
+		}
+		return {
+			messageCount,
+			cachedTokens,
+			uncachedTokens,
+			totalTokens,
+			costTotal,
+		};
+	}
+
+	async getPathToRootOrCompaction(leafId: string | null): Promise<SessionTreeEntry[]> {
 		if (leafId === null) return [];
 		const path: SessionTreeEntry[] = [];
+		let stopAtEntryId: string | null = null;
 		let current = this.byId.get(leafId);
 		if (!current) throw new SessionError("not_found", `Entry ${leafId} not found`);
 		while (current) {
 			path.unshift(current);
+			if (stopAtEntryId !== null && current.id === stopAtEntryId) break;
+			if (current.type === "compaction") {
+				if (current.retainedTail) break;
+				stopAtEntryId = current.firstKeptEntryId ?? null;
+			}
 			if (!current.parentId) break;
 			const parent = this.byId.get(current.parentId);
 			if (!parent) throw new SessionError("invalid_session", `Entry ${current.parentId} not found`);
@@ -297,7 +368,9 @@ export class JsonlSessionStorage implements SessionStorage<JsonlSessionMetadata>
 		return path;
 	}
 
-	async getEntries(): Promise<SessionTreeEntry[]> {
-		return [...this.entries];
+	async getEntries(options?: SessionEntryCursorOptions): Promise<SessionTreeEntry[]> {
+		const start = options?.afterEntrySeq ?? 0;
+		const end = options?.limit === undefined ? undefined : start + options.limit;
+		return this.entries.slice(start, end);
 	}
 }

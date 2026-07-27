@@ -13,12 +13,12 @@ export interface ModelRoutesDeps {
 }
 
 export function registerModelRoutes(app: Hono, deps: ModelRoutesDeps): void {
-	app.get("/api/models", (context) => {
+	app.get("/api/models", async (context) => {
 		const sessionId = context.req.query("session_id") ?? deps.sessionHost.defaultSessionId;
 		const entry = deps.sessionHost.get(sessionId);
 		if (!entry) return context.json({ error: "Session not found" } as const, 404);
 		return context.json(
-			entry.runtime.services.modelRegistry.getAvailable().map((model: Model<Api>) => ({
+			(await entry.runtime.services.modelRuntime.getAvailable()).map((model: Model<Api>) => ({
 				id: model.id,
 				name: model.name,
 				provider: model.provider,

@@ -261,18 +261,27 @@ npm ci --ignore-scripts
 Common commands:
 
 ```bash
-npm run check        # Format, lint, dependency checks, and TypeScript checks
-./test.sh            # Non-e2e test suite
-./pi-test.sh         # Run Pi directly from source
+npm run check          # Format, lint, dependency checks, and TypeScript checks
+./test.sh              # Non-e2e test suite
+./pi-test.sh           # Run Pi directly from source
 ./pi-test.sh --mode web --port 3000
+npm run build          # Refresh model data, then build all packages
+npm run build:offline  # Rebuild using existing model data without network access
+npm test               # Full workspace test command
 ```
 
-Build and full test commands are intentionally separate from `npm run check`:
+## Building Standalone Binaries from Release Source
+
+GitHub releases include a versioned source archive covered by the release's `SHA256SUMS` file. Extract it and run the same build script used for the standalone binaries:
 
 ```bash
-npm run build
-npm test
+VERSION="<release-version>"
+tar -xzf "pi-${VERSION}-source.tar.gz"
+cd "pi-${VERSION}"
+./scripts/build-binaries.sh --offline-model-data --platform linux-x64 --out "$PWD/out"
 ```
+
+The source archive includes the generated provider model data used for the release. `--offline-model-data` builds with that snapshot instead of refreshing it from live provider catalogs. The script still installs dependencies, builds the monorepo, compiles the Bun executable, and stages its runtime assets. Package maintainers who provide dependencies separately can pass `--skip-install --skip-deps`.
 
 See [AGENTS.md](AGENTS.md) for repository-specific development rules and [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor gate and review process.
 
