@@ -71,7 +71,15 @@ jobs:
           retention-days: 14
 
   publish:
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+    # The target bucket and credentials belong to the upstream repository.
+    # Forks may still generate and validate catalogs without attempting publication.
+    if: >-
+      github.repository == 'earendil-works/pi' &&
+      (
+        github.event_name == 'schedule' ||
+        github.event_name == 'workflow_run' ||
+        (github.event_name == 'workflow_dispatch' && inputs.publish)
+      )
     needs: generate
     runs-on: ubuntu-latest
     environment: pi-model-upload
