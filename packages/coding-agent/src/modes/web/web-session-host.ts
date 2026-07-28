@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type { SessionManager } from "../../core/session-manager.ts";
 import type { CreateSessionRequest, CreateSessionResponse, SessionSummary, WebSessionEntry } from "./types.ts";
+import { createWebExtensionUIContext } from "./ui-context.ts";
 import type { ConnectionManager } from "./ws/connection-manager.ts";
 
 export type WebRuntimeFactory = (cwd: string, sessionManager: SessionManager) => Promise<AgentSessionRuntime>;
@@ -140,6 +141,7 @@ export class WebSessionHost {
 
 	private bindWebExtensions(runtime: AgentSessionRuntime, sessionId: string): Promise<void> {
 		return runtime.session.bindExtensions({
+			uiContext: createWebExtensionUIContext(sessionId, this.connectionManager),
 			mode: "web",
 			commandContextActions: {
 				waitForIdle: () => runtime.session.agent.waitForIdle(),

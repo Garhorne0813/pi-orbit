@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Web mode REST parity for queued messages, agent cancellation, queue and retry settings, model and thinking cycling, session switching, commands, fork messages, and assistant text.
+- Added a session-isolated WebSocket extension UI protocol with dialog responses, cancellation, timeouts, and fire-and-forget UI updates.
+
 ### Changed
 
 - Replaced Web mode's hand-written Node.js HTTP and WebSocket protocol implementation with the maintained Hono Node and `ws` adapters.

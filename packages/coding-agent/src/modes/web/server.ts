@@ -15,7 +15,7 @@ import { registerPromptRoutes } from "./routes/prompt.ts";
 import { registerSessionRoutes } from "./routes/sessions.ts";
 import { registerToolRoutes } from "./routes/tools.ts";
 import type { HealthResponse } from "./types.ts";
-import { isWsClientCommand } from "./types.ts";
+import { isWsClientMessage } from "./types.ts";
 import type { WebSessionHost } from "./web-session-host.ts";
 import type { ConnectionManager } from "./ws/connection-manager.ts";
 
@@ -38,7 +38,7 @@ export function createApp(options: CreateAppOptions): Hono {
 		cors({
 			origin: options.corsOrigin ?? "*",
 			allowHeaders: ["Content-Type", "Authorization"],
-			allowMethods: ["GET", "POST", "PATCH", "DELETE"],
+			allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
 		}),
 	);
 	app.get("/api/health", (context) => context.json<HealthResponse>({ status: "ok", version: VERSION }));
@@ -86,8 +86,14 @@ export function createApp(options: CreateAppOptions): Hono {
 						websocket.send(JSON.stringify({ type: "command_error", error: "Invalid JSON command" }));
 						return;
 					}
-					if (!isWsClientCommand(data)) {
+					if (!isWsClientMessage(data)) {
 						websocket.send(JSON.stringify({ type: "command_error", error: "Invalid command" }));
+						return;
+					}
+					if (data.type === "extension_ui_response") {
+						if (!connectionManager.resolveUIResponse(sessionId, data)) {
+							websocket.send(JSON.stringify({ type: "command_error", error: "Unknown extension UI request" }));
+						}
 						return;
 					}
 					void commands.execute(sessionId, data).catch((error: unknown) => {

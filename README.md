@@ -144,7 +144,11 @@ The prompt endpoint returns HTTP `202` after prompt preflight succeeds. Generate
 | `GET` | `/api/sessions/:id/messages` | Read the current message history |
 | `GET` | `/api/sessions/:id/entries?since=<id>` | Read all or incremental session entries |
 | `GET` | `/api/sessions/:id/tree` | Read the session branch tree and current leaf |
+| `GET` | `/api/sessions/:id/commands` | List extension, prompt-template, and skill commands |
+| `GET` | `/api/sessions/:id/fork-messages` | List user messages available as fork points |
+| `GET` | `/api/sessions/:id/last-assistant-text` | Read the last assistant text, if present |
 | `PATCH` | `/api/sessions/:id` | Rename a session with `{ "name": "..." }` |
+| `POST` | `/api/sessions/:id/switch` | Switch the runtime to `{ "sessionPath": "...", "cwdOverride": "..." }` |
 | `POST` | `/api/sessions/:id/clone` | Clone the current session at its active leaf |
 | `POST` | `/api/sessions/:id/restart` | Recreate the runtime while preserving the Web session ID |
 | `POST` | `/api/sessions/:id/export` | Export a persisted session to HTML |
@@ -157,13 +161,24 @@ The startup session is protected from deletion. Use its `restart` endpoint when 
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/sessions/:id/prompt` | Submit `{ "message": "..." }` |
+| `POST` | `/api/sessions/:id/steer` | Queue `{ "message": "...", "images": [...] }` as steering input |
+| `POST` | `/api/sessions/:id/follow-up` | Queue a follow-up message after the active turn |
 | `POST` | `/api/sessions/:id/abort` | Abort the active agent run |
+| `POST` | `/api/sessions/:id/abort-bash` | Abort the active direct bash command |
+| `POST` | `/api/sessions/:id/abort-retry` | Abort an automatic retry delay |
 | `POST` | `/api/sessions/:id/bash` | Execute a shell command and return its result |
 | `POST` | `/api/sessions/:id/compact` | Compact context and return the compaction result |
 | `POST` | `/api/sessions/:id/fork` | Fork at an optional `entryId` |
 | `GET` | `/api/models?session_id=<id>` | List models with configured authentication |
 | `POST` | `/api/sessions/:id/model` | Select `{ "provider": "...", "modelId": "..." }` exactly |
+| `POST` | `/api/sessions/:id/cycle-model` | Cycle models forward or backward |
 | `POST` | `/api/sessions/:id/thinking` | Set `off`, `minimal`, `low`, `medium`, `high`, or `xhigh` |
+| `POST` | `/api/sessions/:id/cycle-thinking` | Cycle through levels supported by the current model |
+| `GET` | `/api/sessions/:id/thinking-levels` | List thinking levels supported by the current model |
+| `PUT` | `/api/sessions/:id/steering-mode` | Set queue mode to `all` or `one-at-a-time` |
+| `PUT` | `/api/sessions/:id/follow-up-mode` | Set follow-up queue mode |
+| `PUT` | `/api/sessions/:id/auto-compaction` | Enable or disable automatic compaction |
+| `PUT` | `/api/sessions/:id/auto-retry` | Enable or disable automatic retry |
 
 Prompt requests are limited per session with a token bucket. The current default is 30 requests per minute.
 
@@ -179,6 +194,8 @@ WebSocket clients may also submit a prompt command:
 ```json
 { "type": "prompt", "message": "Run the relevant tests." }
 ```
+
+They may abort the active agent run with `{ "type": "abort" }`. Extensions using `ctx.ui` emit session-scoped `extension_ui_request` messages over the same connection. Clients answer blocking dialogs with `extension_ui_response`; notifications, status, title, editor text, and string-array widgets are fire-and-forget. See the [complete Web mode protocol](packages/coding-agent/docs/web-mode.md#extension-ui-protocol).
 
 Authenticated WebSocket upgrades must carry `Authorization: Bearer <token>` as an HTTP header. Tokens in URL query parameters are rejected. Node clients and command-line clients such as `websocat` can set the header directly:
 
