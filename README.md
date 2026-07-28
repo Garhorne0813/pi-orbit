@@ -3,7 +3,7 @@
   <p><strong>An unofficial, Web-focused fork of Pi Agent Harness.</strong></p>
   <p>
     Run Pi interactively, embed it through an SDK or RPC, or serve multiple isolated agent sessions
-    from one authenticated HTTP process.
+    from one authenticated HTTP runtime host.
   </p>
   <p>
     <a href="README.zh-CN.md">简体中文</a>
@@ -25,7 +25,7 @@
 
 Pi Web builds on Pi, a small agent harness with strong defaults and a deliberately open extension model. Pi provides the agent loop, model integrations, session persistence, terminal UI, tools, and transport layers while leaving product-specific workflows to extensions and host applications.
 
-This repository includes a first-class Web mode for control planes and browser-facing products. A single `pi --mode web` process can own multiple sessions, each with its own `AgentSessionRuntime`, message history, model state, working directory, and event stream.
+This repository includes a first-class Web mode for control planes and browser-facing products. A single `pi --mode web` process can own multiple logically isolated runtimes, each with its own `AgentSessionRuntime`, message history, model state, working directory, and replayable event stream.
 
 > New issues and pull requests from new contributors are automatically closed for maintainer review. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -38,7 +38,7 @@ This repository includes a first-class Web mode for control planes and browser-f
 | Sessions | Persistent histories, branching, forking, compaction, naming, export, and tree navigation |
 | Customization | TypeScript extensions, skills, prompt templates, themes, and installable Pi packages |
 | Integrations | SDK, JSON events, stdin/stdout RPC, REST, WebSocket, and Server-Sent Events |
-| Web concurrency | Multiple independently addressable agent sessions in one Pi process |
+| Web concurrency | Multiple independently addressable runtimes in one Pi process, with explicit runtime and persisted-session identities |
 | Deployment | Optional Bearer authentication, configurable CORS, prompt rate limiting, and connection heartbeats |
 
 Pi intentionally does not impose a built-in workflow such as subagents or plan mode. Add those capabilities through extensions and skills, or embed the runtime in an application that defines its own workflow.
@@ -83,7 +83,7 @@ See the [coding-agent guide](packages/coding-agent/README.md), [JSON protocol](p
 
 ## Web Mode
 
-Web mode turns Pi into a local agent service. One process hosts a default session and any number of dynamic sessions created through the API.
+Web mode turns Pi into a local agent service and runtime host. One process hosts a protected startup runtime and up to 64 runtimes by default. Inactive dynamic runtimes are evicted after 30 minutes by default; persisted JSONL sessions remain available for explicit resume.
 
 ### Start the server
 
@@ -100,8 +100,14 @@ export PI_WEB_CORS_ORIGIN='https://your-control-plane.example'
 | `--port`, `PI_WEB_PORT` | `3000` | HTTP port, from 1 to 65535 |
 | `--auth-token`, `PI_WEB_AUTH_TOKEN` | unset | Process-wide Bearer token |
 | `PI_WEB_CORS_ORIGIN` | `*` | Allowed browser origin |
+| `PI_WEB_MAX_RUNTIMES` | `64` | Maximum hosted runtimes, including the startup runtime |
+| `PI_WEB_MAX_CONCURRENT_TURNS` | `4` | Maximum simultaneous model turns across all runtimes |
+| `PI_WEB_IDLE_TIMEOUT_MS` | `1800000` | Idle lifetime for recoverable persisted runtimes in milliseconds |
+| `PI_WEB_REQUEST_BODY_LIMIT_BYTES` | `4194304` | Maximum HTTP API request body size |
+| `PI_WEB_RUNTIME_DISPOSE_TIMEOUT_MS` | `10000` | Maximum wait for one runtime to dispose |
+| `PI_WEB_SHUTDOWN_TIMEOUT_MS` | `15000` | Maximum graceful host shutdown time |
 
-The health endpoint is public. All other `/api/*` routes and the WebSocket upgrade require authentication when a token is configured.
+The health and capabilities endpoints are public. Loopback development can run without a token. Binding to a non-loopback host requires both a Bearer token and an explicit CORS origin; insecure startup is rejected.
 
 ### Create a session and stream events
 
@@ -131,6 +137,42 @@ curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/prompt" \
 ```
 
 The prompt endpoint returns HTTP `202` after prompt preflight succeeds. Generated output and tool events continue through SSE or WebSocket. Preflight failures return an error response instead of being silently accepted.
+
+### Runtime Host API
+
+Control planes should use `/api/runtimes`. A `runtimeId` is an ephemeral handle owned by the current Pi Web process; `piSessionId` is the persisted Pi session identity. Session replacement or forking can change `piSessionId` without changing `runtimeId`.
+
+```bash
+RUNTIME=$(curl -fsS -X POST "$BASE_URL/api/runtimes" \
+  -H "$AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cwd":"/absolute/path/to/project",
+    "sessionDir":"/absolute/path/to/pi-sessions"
+  }')
+
+RUNTIME_ID=$(printf '%s' "$RUNTIME" | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeId"])')
+curl -N "$BASE_URL/api/runtimes/$RUNTIME_ID/events" -H "$AUTH_HEADER"
+```
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/capabilities` | Negotiate protocol version and runtime-host features |
+| `POST` | `/api/runtimes` | Create or open a runtime with explicit `cwd`, `sessionDir`, and optional `sessionPath` |
+| `GET` | `/api/runtimes` | List runtime descriptors |
+| `GET` | `/api/runtimes/:runtimeId` | Read both identities, paths, activity, model, and busy state |
+| `GET` | `/api/runtimes/:runtimeId/health` | Read runtime-specific health and protocol information |
+| `POST` | `/api/runtimes/:runtimeId/resume` | Resume an explicit `sessionPath`, optionally checking `piSessionId` |
+| `POST` | `/api/runtimes/:runtimeId/prompt` | Submit a prompt; responses include both identities |
+| `POST` | `/api/runtimes/:runtimeId/abort` | Abort the active turn |
+| `POST` | `/api/runtimes/:runtimeId/compact` | Compact the current context |
+| `POST` | `/api/runtimes/:runtimeId/fork` | Fork the current Pi session while retaining the runtime handle |
+| `POST` | `/api/runtimes/:runtimeId/model` | Select an exact provider and model |
+| `POST` | `/api/runtimes/:runtimeId/ui-response` | Resolve a pending extension UI request over HTTP |
+| `GET` | `/api/runtimes/:runtimeId/events` | Stream versioned runtime event envelopes over SSE |
+| `DELETE` | `/api/runtimes/:runtimeId` | Dispose a dynamic runtime without deleting its JSONL session |
+
+Creation accepts `model` in `provider/modelId` form and an optional `thinking` level. Pi Web is a single-user, shared-process runtime host: environment variables, Provider credentials, `agentDir`, skills, extensions, and MCP configuration are process-level resources shared by every runtime. Runtime-scoped `runtimeEnv`, `skills`, and `extensions` fields are rejected. Stateful or cwd-dependent MCP servers should still use separate connections per runtime.
 
 ### Session API
 
@@ -184,10 +226,12 @@ Prompt requests are limited per session with a token bucket. The current default
 
 ### Event transports
 
-Use either transport for the same serialized `AgentSessionEvent` stream:
+Legacy session transports provide serialized `AgentSessionEvent` values:
 
 - SSE: `GET /api/sessions/:id/events`
 - WebSocket: `GET /ws?session_id=<id>`
+
+The runtime-host transport uses `GET /api/runtimes/:runtimeId/events`. It subscribes when the runtime is created, not when a client connects, and wraps each event with `protocolVersion`, `runtimeId`, `piSessionId`, monotonic `sequence`, and `timestamp`. Supply `Last-Event-ID` or `?after=<sequence>` to replay the in-memory ring buffer. HTTP 409 with `event_replay_gap` means the caller must reconcile from runtime state because the requested sequence has expired.
 
 WebSocket clients may also submit a prompt command:
 
@@ -217,7 +261,7 @@ flowchart LR
 
     subgraph WEB["One Pi Web mode process"]
         API["Hono REST API"]
-        EVENTS["WebSocket and SSE fan-out"]
+        EVENTS["Permanent runtime event bus and replay buffer"]
         HOST["WebSessionHost"]
         S1["AgentSessionRuntime A"]
         S2["AgentSessionRuntime B"]
@@ -232,9 +276,9 @@ flowchart LR
     T --> API
 ```
 
-Web mode is a transport layer over the same `AgentSession` used by interactive and RPC modes. `WebSessionHost` owns the process-local session registry; `ConnectionManager` subscribes clients to the correct runtime and rebinds event delivery when a runtime replaces its underlying session.
+Web mode is a transport layer over the same `AgentSession` used by interactive and RPC modes. `WebSessionHost` owns the process-local runtime registry, capacity limits, activity tracking, and idle eviction. `ConnectionManager` permanently subscribes to each runtime, preserves event ordering in a bounded ring buffer, and rebinds delivery when a runtime replaces its underlying Pi session.
 
-Session isolation is logical, not an operating-system security boundary. Sessions have separate runtime state but share the Pi process, host credentials, filesystem permissions, and network access.
+Session isolation is logical, not an operating-system security boundary. Sessions have separate runtime state but share the Pi process, environment, Provider credentials, agent resources, filesystem permissions, and network access. This mode targets one user and one trust domain, not mutually untrusted tenants.
 
 ## Packages
 
@@ -261,7 +305,7 @@ For production deployments:
 - Apply CPU, memory, filesystem, and network limits outside Pi.
 - Treat the bash endpoint and agent tools as remote code execution within the Pi trust domain.
 
-WebSocket clients are pinged every 30 seconds; connections that stop answering are terminated. Failed event delivery closes the affected connection. The session registry itself is in memory, although sessions configured with persistent `SessionManager` storage can write history to disk.
+WebSocket clients are pinged every 30 seconds; connections that stop answering are terminated. Failed event delivery closes only the affected connection. Runtime handles and replay buffers are in memory. Idle eviction applies only after a persisted session file actually exists; in-memory and not-yet-flushed sessions are never automatically evicted. Stuck runtime disposal and host shutdown are bounded by configurable deadlines.
 
 See [containerization guidance](packages/coding-agent/docs/containerization.md) for Gondolin, Docker, and OpenShell isolation patterns, and read [SECURITY.md](SECURITY.md) before exposing Pi beyond a local trust boundary.
 

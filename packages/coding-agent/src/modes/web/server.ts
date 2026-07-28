@@ -3,6 +3,7 @@
 import type { AddressInfo } from "node:net";
 import { createAdaptorServer, upgradeWebSocket } from "@hono/node-server";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { type WebSocket, WebSocketServer } from "ws";
 import { VERSION } from "../../config.ts";
@@ -12,10 +13,10 @@ import { createSessionRateLimit, type RateLimitOptions } from "./middleware/rate
 import { registerEventRoutes } from "./routes/events.ts";
 import { registerModelRoutes } from "./routes/model.ts";
 import { registerPromptRoutes } from "./routes/prompt.ts";
+import { registerRuntimeRoutes } from "./routes/runtimes.ts";
 import { registerSessionRoutes } from "./routes/sessions.ts";
 import { registerToolRoutes } from "./routes/tools.ts";
-import type { HealthResponse } from "./types.ts";
-import { isWsClientMessage } from "./types.ts";
+import { type HealthResponse, isWsClientMessage, RUNTIME_CAPABILITIES } from "./types.ts";
 import type { WebSessionHost } from "./web-session-host.ts";
 import type { ConnectionManager } from "./ws/connection-manager.ts";
 
@@ -26,6 +27,7 @@ export interface CreateAppOptions {
 	commands?: WebCommandHandler;
 	promptRateLimit?: RateLimitOptions;
 	corsOrigin?: string;
+	requestBodyLimitBytes?: number;
 }
 
 export function createApp(options: CreateAppOptions): Hono {
@@ -41,13 +43,34 @@ export function createApp(options: CreateAppOptions): Hono {
 			allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
 		}),
 	);
-	app.get("/api/health", (context) => context.json<HealthResponse>({ status: "ok", version: VERSION }));
+	app.use(
+		"/api/*",
+		bodyLimit({
+			maxSize: options.requestBodyLimitBytes ?? 4 * 1024 * 1024,
+			onError: (context) =>
+				context.json({ error: "Request body too large", code: "request_body_too_large" } as const, 413),
+		}),
+	);
+	app.get("/api/health", (context) =>
+		context.json<HealthResponse>({
+			status: "ok",
+			version: VERSION,
+			protocolVersion: 1,
+			runtimeHost: sessionHost.getHealth(),
+		}),
+	);
+	app.get("/api/capabilities", (context) => context.json({ ...RUNTIME_CAPABILITIES, piVersion: VERSION }));
 	app.use("/api/*", accessPolicy.createHttpMiddleware());
 
 	registerSessionRoutes(app, { sessionHost });
+	registerRuntimeRoutes(app, sessionHost, commands, connectionManager);
 	registerEventRoutes(app, { sessionHost, connectionManager });
 	app.use(
 		"/api/sessions/:id/prompt",
+		createSessionRateLimit(options.promptRateLimit ?? { limit: 30, windowMs: 60_000 }),
+	);
+	app.use(
+		"/api/runtimes/:runtimeId/prompt",
 		createSessionRateLimit(options.promptRateLimit ?? { limit: 30, windowMs: 60_000 }),
 	);
 	registerPromptRoutes(app, { commands });

@@ -3,7 +3,7 @@
   <p><strong>基于 Pi Agent Harness、聚焦 Web 场景的非官方 fork。</strong></p>
   <p>
     你可以交互式运行 Pi，通过 SDK 或 RPC 嵌入 Pi，
-    也可以在一个经过认证的 HTTP 进程中承载多个相互隔离的智能体会话。
+    也可以在一个经过认证的 HTTP 运行时宿主中承载多个逻辑隔离的智能体会话。
   </p>
   <p>
     <a href="README.md">English</a>
@@ -25,7 +25,7 @@
 
 Pi Web 构建于 Pi 之上。Pi 是一个具备可靠默认能力和开放扩展模型的小型智能体框架，提供智能体循环、模型集成、会话持久化、终端界面、工具和传输层，同时把具体产品工作流交给扩展或宿主应用定义。
 
-本仓库包含面向控制平面和浏览器产品的一等 Web mode。单个 `pi --mode web` 进程可以管理多个会话；每个会话都拥有独立的 `AgentSessionRuntime`、消息历史、模型状态、工作目录和事件流。
+本仓库包含面向控制平面和浏览器产品的一等 Web mode。单个 `pi --mode web` 进程可以管理多个逻辑隔离的运行时；每个运行时都拥有独立的 `AgentSessionRuntime`、消息历史、模型状态、工作目录和可重放事件流。
 
 > 新贡献者提交的 Issue 和 Pull Request 会自动关闭并交由维护者审核。详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
@@ -38,7 +38,7 @@ Pi Web 构建于 Pi 之上。Pi 是一个具备可靠默认能力和开放扩展
 | 会话管理 | 持久化历史、分支、派生、上下文压缩、命名、导出和会话树导航 |
 | 自定义 | TypeScript 扩展、技能、提示词模板、主题和可安装的 Pi 包 |
 | 集成方式 | SDK、JSON 事件、stdin/stdout RPC、REST、WebSocket 和 SSE |
-| Web 并发 | 在一个 Pi 进程中管理多个可独立寻址的智能体会话 |
+| Web 并发 | 在一个 Pi 进程中管理多个可独立寻址的运行时，并区分运行时 ID 与持久化会话 ID |
 | 部署能力 | 可选 Bearer 认证、可配置 CORS、提示请求限流和连接心跳 |
 
 Pi 不强制内置子智能体或计划模式等工作流。你可以通过扩展和技能加入这些能力，也可以将运行时嵌入应用，由应用定义自己的工作流。
@@ -83,7 +83,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 
 ## Web Mode
 
-Web mode 会把 Pi 转换为本地智能体服务。一个进程包含一个默认会话，并可通过 API 创建任意数量的动态会话。
+Web mode 会把 Pi 转换为本地智能体服务和运行时宿主。一个进程包含一个受保护的启动运行时，默认最多承载 64 个运行时。动态运行时默认空闲 30 分钟后回收，持久化 JSONL 会话仍可显式恢复。
 
 ### 启动服务
 
@@ -100,8 +100,14 @@ export PI_WEB_CORS_ORIGIN='https://your-control-plane.example'
 | `--port`、`PI_WEB_PORT` | `3000` | HTTP 端口，范围为 1–65535 |
 | `--auth-token`、`PI_WEB_AUTH_TOKEN` | 未设置 | 进程级 Bearer Token |
 | `PI_WEB_CORS_ORIGIN` | `*` | 允许访问的浏览器来源 |
+| `PI_WEB_MAX_RUNTIMES` | `64` | 最大运行时数量，包含启动运行时 |
+| `PI_WEB_MAX_CONCURRENT_TURNS` | `4` | 所有运行时同时执行的最大模型轮次数 |
+| `PI_WEB_IDLE_TIMEOUT_MS` | `1800000` | 可恢复持久化运行时的空闲回收时间，单位为毫秒 |
+| `PI_WEB_REQUEST_BODY_LIMIT_BYTES` | `4194304` | HTTP API 请求体大小上限 |
+| `PI_WEB_RUNTIME_DISPOSE_TIMEOUT_MS` | `10000` | 单个运行时销毁的最长等待时间 |
+| `PI_WEB_SHUTDOWN_TIMEOUT_MS` | `15000` | 宿主优雅关闭的最长等待时间 |
 
-健康检查端点无需认证。配置 Token 后，其他所有 `/api/*` 路由和 WebSocket 升级请求都必须通过认证。
+健康检查和能力端点无需认证。本地 loopback 开发可以不配置 Token；绑定到非 loopback 地址时必须同时配置 Bearer Token 和明确的 CORS Origin，否则服务拒绝启动。
 
 ### 创建会话并接收事件
 
@@ -131,6 +137,42 @@ curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/prompt" \
 ```
 
 提示预检成功后，接口返回 HTTP `202`。随后生成的回复和工具事件会继续通过 SSE 或 WebSocket 推送。预检失败会直接返回错误，不会再被静默接受。
+
+### Runtime Host API
+
+控制平面应使用 `/api/runtimes`。`runtimeId` 是当前 Pi Web 进程内的临时运行时句柄；`piSessionId` 是持久化的 Pi 会话身份。会话替换或派生可能改变 `piSessionId`，但不会改变 `runtimeId`。
+
+```bash
+RUNTIME=$(curl -fsS -X POST "$BASE_URL/api/runtimes" \
+  -H "$AUTH_HEADER" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cwd":"/absolute/path/to/project",
+    "sessionDir":"/absolute/path/to/pi-sessions"
+  }')
+
+RUNTIME_ID=$(printf '%s' "$RUNTIME" | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeId"])')
+curl -N "$BASE_URL/api/runtimes/$RUNTIME_ID/events" -H "$AUTH_HEADER"
+```
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| `GET` | `/api/capabilities` | 协商协议版本和宿主能力 |
+| `POST` | `/api/runtimes` | 使用显式 `cwd`、`sessionDir` 和可选 `sessionPath` 创建或打开运行时 |
+| `GET` | `/api/runtimes` | 列出运行时描述符 |
+| `GET` | `/api/runtimes/:runtimeId` | 获取双 ID、路径、活动时间、模型和忙碌状态 |
+| `GET` | `/api/runtimes/:runtimeId/health` | 获取运行时健康状态和协议信息 |
+| `POST` | `/api/runtimes/:runtimeId/resume` | 恢复显式 `sessionPath`，并可校验 `piSessionId` |
+| `POST` | `/api/runtimes/:runtimeId/prompt` | 提交提示，响应同时包含两个 ID |
+| `POST` | `/api/runtimes/:runtimeId/abort` | 中止当前轮次 |
+| `POST` | `/api/runtimes/:runtimeId/compact` | 压缩当前上下文 |
+| `POST` | `/api/runtimes/:runtimeId/fork` | 保留运行时句柄并派生新的 Pi 会话 |
+| `POST` | `/api/runtimes/:runtimeId/model` | 精确选择服务商和模型 |
+| `POST` | `/api/runtimes/:runtimeId/ui-response` | 通过 HTTP 响应待处理的扩展 UI 请求 |
+| `GET` | `/api/runtimes/:runtimeId/events` | 通过 SSE 接收带版本的运行时事件 envelope |
+| `DELETE` | `/api/runtimes/:runtimeId` | 销毁动态运行时，但不删除 JSONL 会话 |
+
+创建请求支持 `provider/modelId` 格式的 `model` 和可选 `thinking`。Pi Web 定位为单用户共享进程运行时宿主：环境变量、Provider 凭据、`agentDir`、skills、extensions 和 MCP 配置均为所有运行时共享的进程级资源。服务会拒绝运行时专属的 `runtimeEnv`、`skills` 和 `extensions` 字段。对于保存状态或依赖 `cwd` 的 MCP Server，仍应为不同运行时建立独立连接。
 
 ### 会话 API
 
@@ -184,10 +226,12 @@ curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/prompt" \
 
 ### 事件传输
 
-以下两种方式传输相同的序列化 `AgentSessionEvent` 事件流：
+旧版 session 传输接口提供序列化的 `AgentSessionEvent`：
 
 - SSE：`GET /api/sessions/:id/events`
 - WebSocket：`GET /ws?session_id=<id>`
+
+运行时宿主使用 `GET /api/runtimes/:runtimeId/events`。事件订阅在运行时创建时建立，而不是在客户端连接时建立；每个事件都包含 `protocolVersion`、`runtimeId`、`piSessionId`、单调递增的 `sequence` 和 `timestamp`。客户端可以传入 `Last-Event-ID` 或 `?after=<sequence>` 重放内存环形缓冲。若返回 HTTP 409 和 `event_replay_gap`，说明请求序号已经过期，调用方必须从运行时状态重新对账。
 
 WebSocket 客户端还可以发送提示命令：
 
@@ -217,7 +261,7 @@ flowchart LR
 
     subgraph WEB["单个 Pi Web mode 进程"]
         API["Hono REST API"]
-        EVENTS["WebSocket 与 SSE 事件分发"]
+        EVENTS["永久运行时事件总线与重放缓冲"]
         HOST["WebSessionHost"]
         S1["AgentSessionRuntime A"]
         S2["AgentSessionRuntime B"]
@@ -232,9 +276,9 @@ flowchart LR
     T --> API
 ```
 
-Web mode 是构建在 `AgentSession` 之上的传输层，交互模式和 RPC 模式同样使用该会话核心。`WebSessionHost` 管理进程内会话注册表；`ConnectionManager` 把客户端订阅到正确的运行时，并在运行时替换底层会话后重新绑定事件流。
+Web mode 是构建在 `AgentSession` 之上的传输层，交互模式和 RPC 模式同样使用该会话核心。`WebSessionHost` 管理进程内运行时注册表、容量限制、活动时间和空闲回收；`ConnectionManager` 永久订阅每个运行时，在有限环形缓冲中保持事件顺序，并在运行时替换底层 Pi 会话后重新绑定事件流。
 
-会话隔离是逻辑隔离，不是操作系统安全边界。不同会话具有独立的运行时状态，但共享 Pi 进程、主机凭据、文件系统权限和网络访问能力。
+会话隔离是逻辑隔离，不是操作系统安全边界。不同会话具有独立运行时状态，但共享 Pi 进程、环境变量、Provider 凭据、智能体资源、文件系统权限和网络访问能力。本模式面向单用户、单信任域，不适合互不信任的租户。
 
 ## 软件包
 
@@ -261,7 +305,7 @@ Pi 使用启动它的操作系统用户权限运行。Web Token 用于认证整�
 - 在 Pi 外部施加 CPU、内存、文件系统和网络限制。
 - 将 bash 端点和智能体工具视为 Pi 信任域内的远程代码执行能力。
 
-服务器每 30 秒向 WebSocket 客户端发送一次 ping，并终止不再响应的连接。事件发送失败时也会关闭对应连接。会话注册表保存在内存中；使用持久化 `SessionManager` 的会话仍可把历史写入磁盘。
+服务器每 30 秒向 WebSocket 客户端发送一次 ping，并终止不再响应的连接。事件发送失败时只关闭对应连接。运行时句柄和重放缓冲保存在内存中。只有会话文件已经实际落盘的持久化运行时才会被空闲回收；内存会话和尚未写入 JSONL 的会话不会自动回收。卡住的运行时销毁和宿主关闭受可配置期限约束。
 
 Gondolin、Docker 和 OpenShell 隔离方式参见[容器化指南](packages/coding-agent/docs/containerization.md)。将 Pi 暴露到本地信任边界以外之前，请先阅读 [SECURITY.md](SECURITY.md)。
 
