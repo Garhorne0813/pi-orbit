@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 import {
 	type CreateAgentSessionRuntimeFactory,
@@ -16,6 +16,7 @@ import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { WebAccessPolicy } from "../src/modes/web/middleware/auth.ts";
 import { createApp, WebServerHost } from "../src/modes/web/server.ts";
+import { createWebExtensionUIContext } from "../src/modes/web/ui-context.ts";
 import { resolveWebModeOptions } from "../src/modes/web/web-mode.ts";
 import { WebSessionHost } from "../src/modes/web/web-session-host.ts";
 import { ConnectionManager } from "../src/modes/web/ws/connection-manager.ts";
@@ -134,6 +135,7 @@ describe("web mode server", () => {
 			baseUrl: `http://127.0.0.1:${address.port}`,
 			wsUrl: `ws://127.0.0.1:${address.port}`,
 			sessionHost,
+			connectionManager,
 			authStorage,
 			root,
 		};
@@ -186,6 +188,97 @@ describe("web mode server", () => {
 		expect(await response).toContain("websocket response");
 	});
 
+	it("resolves extension UI dialogs through the matching session WebSocket", async () => {
+		const { wsUrl, sessionHost, connectionManager } = await createHarness();
+		const sessionId = sessionHost.defaultSessionId;
+		const websocket = new WebSocket(`${wsUrl}/ws?session_id=${sessionId}`);
+		await once(websocket, "open");
+		cleanups.push(() => websocket.close());
+		const ui = createWebExtensionUIContext(sessionId, connectionManager);
+
+		websocket.once("message", (data) => {
+			const request = JSON.parse(data.toString()) as { type: string; id: string; method: string };
+			expect(request).toMatchObject({ type: "extension_ui_request", method: "confirm" });
+			websocket.send(JSON.stringify({ type: "extension_ui_response", id: request.id, confirmed: true }));
+		});
+
+		await expect(ui.confirm("Permission", "Continue?")).resolves.toBe(true);
+	});
+
+	it("handles extension UI fallback, timeout, abort, and fire-and-forget messages", async () => {
+		const { wsUrl, sessionHost, connectionManager } = await createHarness();
+		const sessionId = sessionHost.defaultSessionId;
+		const ui = createWebExtensionUIContext(sessionId, connectionManager);
+		await expect(ui.confirm("No client", "Continue?")).resolves.toBe(false);
+
+		const websocket = new WebSocket(`${wsUrl}/ws?session_id=${sessionId}`);
+		await once(websocket, "open");
+		cleanups.push(() => websocket.close());
+		const messages: Array<{ method?: string }> = [];
+		websocket.on("message", (data) => messages.push(JSON.parse(data.toString()) as { method?: string }));
+
+		await expect(ui.input("Timeout", undefined, { timeout: 10 })).resolves.toBeUndefined();
+		const controller = new AbortController();
+		const selection = ui.select("Abort", ["one"], { signal: controller.signal });
+		controller.abort();
+		await expect(selection).resolves.toBeUndefined();
+		ui.notify("notice", "warning");
+		ui.setStatus("build", "running");
+		ui.setTitle("Pi Web");
+		ui.setEditorText("draft");
+		ui.setWidget("summary", ["line"], { placement: "belowEditor" });
+		await new Promise((resolve) => setTimeout(resolve, 10));
+
+		expect(messages.map((message) => message.method)).toEqual(
+			expect.arrayContaining(["input", "select", "notify", "setStatus", "setTitle", "set_editor_text", "setWidget"]),
+		);
+		expect(connectionManager.getPendingUIRequests(sessionId)).toEqual([]);
+	});
+
+	it("isolates extension UI responses by session and accepts only the first valid response", async () => {
+		const { baseUrl, wsUrl, sessionHost, connectionManager } = await createHarness();
+		const created = await fetch(`${baseUrl}/api/sessions`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ name: "other" }),
+		});
+		const { sessionId: otherSessionId } = (await created.json()) as { sessionId: string };
+		const sessionId = sessionHost.defaultSessionId;
+		const first = new WebSocket(`${wsUrl}/ws?session_id=${sessionId}`);
+		const second = new WebSocket(`${wsUrl}/ws?session_id=${sessionId}`);
+		const other = new WebSocket(`${wsUrl}/ws?session_id=${otherSessionId}`);
+		await Promise.all([once(first, "open"), once(second, "open"), once(other, "open")]);
+		cleanups.push(
+			() => first.close(),
+			() => second.close(),
+			() => other.close(),
+		);
+
+		const requestPromise = once(first, "message");
+		const result = createWebExtensionUIContext(sessionId, connectionManager).confirm("Choose", "Continue?");
+		const [data] = await requestPromise;
+		const request = JSON.parse(data.toString()) as { id: string };
+		other.send(JSON.stringify({ type: "extension_ui_response", id: request.id, confirmed: false }));
+		second.send(JSON.stringify({ type: "extension_ui_response", id: request.id, value: "invalid for confirm" }));
+		first.send(JSON.stringify({ type: "extension_ui_response", id: request.id, confirmed: true }));
+
+		await expect(result).resolves.toBe(true);
+		expect(connectionManager.getPendingUIRequests(sessionId)).toEqual([]);
+	});
+
+	it("accepts abort commands over WebSocket", async () => {
+		const { wsUrl, sessionHost } = await createHarness();
+		const session = sessionHost.get(sessionHost.defaultSessionId)?.runtime.session;
+		if (!session) throw new Error("missing default session");
+		const abort = vi.spyOn(session, "abort");
+		const websocket = new WebSocket(`${wsUrl}/ws?session_id=${sessionHost.defaultSessionId}`);
+		await once(websocket, "open");
+		cleanups.push(() => websocket.close());
+		websocket.send(JSON.stringify({ type: "abort" }));
+
+		await vi.waitFor(() => expect(abort).toHaveBeenCalledOnce());
+	});
+
 	it("terminates WebSocket clients that stop answering heartbeats", async () => {
 		const { wsUrl, sessionHost } = await createHarness({ heartbeatIntervalMs: 20 });
 		const websocket = new WebSocket(`${wsUrl}/ws?session_id=${sessionHost.defaultSessionId}`, { autoPong: false });
@@ -231,6 +324,115 @@ describe("web mode server", () => {
 		const deletion = await fetch(`${baseUrl}/api/sessions/${sessionHost.defaultSessionId}`, { method: "DELETE" });
 		expect(deletion.status).toBe(403);
 		expect(sessionHost.get(sessionHost.defaultSessionId)).toBeDefined();
+	});
+
+	it("exposes queued-message and agent cancellation controls", async () => {
+		const { baseUrl, sessionHost } = await createHarness();
+		const sessionId = sessionHost.defaultSessionId;
+		const session = sessionHost.get(sessionId)?.runtime.session;
+		if (!session) throw new Error("missing default session");
+		const steer = vi.spyOn(session, "steer").mockResolvedValue();
+		const followUp = vi.spyOn(session, "followUp").mockResolvedValue();
+		const abortBash = vi.spyOn(session, "abortBash");
+		const abortRetry = vi.spyOn(session, "abortRetry");
+
+		const steerResponse = await fetch(`${baseUrl}/api/sessions/${sessionId}/steer`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ message: "change course" }),
+		});
+		const followUpResponse = await fetch(`${baseUrl}/api/sessions/${sessionId}/follow-up`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ message: "then summarize" }),
+		});
+		const abortBashResponse = await fetch(`${baseUrl}/api/sessions/${sessionId}/abort-bash`, {
+			method: "POST",
+		});
+		const abortRetryResponse = await fetch(`${baseUrl}/api/sessions/${sessionId}/abort-retry`, {
+			method: "POST",
+		});
+
+		expect(steerResponse.status).toBe(200);
+		expect(followUpResponse.status).toBe(200);
+		expect(abortBashResponse.status).toBe(200);
+		expect(abortRetryResponse.status).toBe(200);
+		expect(steer).toHaveBeenCalledWith("change course", undefined);
+		expect(followUp).toHaveBeenCalledWith("then summarize", undefined);
+		expect(abortBash).toHaveBeenCalledOnce();
+		expect(abortRetry).toHaveBeenCalledOnce();
+	});
+
+	it("updates queue and automation settings and cycles model state", async () => {
+		const { baseUrl, sessionHost } = await createHarness();
+		const sessionId = sessionHost.defaultSessionId;
+		const session = sessionHost.get(sessionId)?.runtime.session;
+		if (!session) throw new Error("missing default session");
+		const cycleModel = vi.spyOn(session, "cycleModel").mockResolvedValue(undefined);
+
+		for (const [path, body] of [
+			["steering-mode", { mode: "one-at-a-time" }],
+			["follow-up-mode", { mode: "one-at-a-time" }],
+			["auto-compaction", { enabled: false }],
+			["auto-retry", { enabled: false }],
+		] as const) {
+			const response = await fetch(`${baseUrl}/api/sessions/${sessionId}/${path}`, {
+				method: "PUT",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(body),
+			});
+			expect(response.status).toBe(200);
+		}
+
+		const cycleModelResponse = await fetch(`${baseUrl}/api/sessions/${sessionId}/cycle-model`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ direction: "backward" }),
+		});
+		const cycleThinkingResponse = await fetch(`${baseUrl}/api/sessions/${sessionId}/cycle-thinking`, {
+			method: "POST",
+		});
+		const thinkingLevelsResponse = await fetch(`${baseUrl}/api/sessions/${sessionId}/thinking-levels`);
+
+		expect(cycleModelResponse.status).toBe(200);
+		expect(await cycleModelResponse.json()).toEqual({ result: null });
+		expect(cycleModel).toHaveBeenCalledWith("backward");
+		expect(cycleThinkingResponse.status).toBe(200);
+		expect(await cycleThinkingResponse.json()).toHaveProperty("level");
+		expect(thinkingLevelsResponse.status).toBe(200);
+		expect(await thinkingLevelsResponse.json()).toHaveProperty("levels");
+		expect(session.steeringMode).toBe("one-at-a-time");
+		expect(session.followUpMode).toBe("one-at-a-time");
+		expect(session.autoCompactionEnabled).toBe(false);
+		expect(session.autoRetryEnabled).toBe(false);
+	});
+
+	it("exposes session commands, fork messages, assistant text, and switching", async () => {
+		const { baseUrl, sessionHost, root } = await createHarness({ persistedSession: true });
+		const sessionId = sessionHost.defaultSessionId;
+		const runtime = sessionHost.get(sessionId)?.runtime;
+		if (!runtime) throw new Error("missing default runtime");
+		await runtime.session.prompt("hello");
+		const switchSession = vi.spyOn(runtime, "switchSession").mockResolvedValue({ cancelled: false });
+
+		const commands = await fetch(`${baseUrl}/api/sessions/${sessionId}/commands`);
+		const forkMessages = await fetch(`${baseUrl}/api/sessions/${sessionId}/fork-messages`);
+		const assistantText = await fetch(`${baseUrl}/api/sessions/${sessionId}/last-assistant-text`);
+		const switched = await fetch(`${baseUrl}/api/sessions/${sessionId}/switch`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ sessionPath: "/tmp/example.jsonl", cwdOverride: root }),
+		});
+
+		expect(commands.status).toBe(200);
+		expect(await commands.json()).toEqual({ commands: [] });
+		expect(forkMessages.status).toBe(200);
+		expect(await forkMessages.json()).toMatchObject({ messages: [{ text: "hello" }] });
+		expect(assistantText.status).toBe(200);
+		expect(await assistantText.json()).toEqual({ text: "websocket response" });
+		expect(switched.status).toBe(200);
+		expect(await switched.json()).toEqual({ success: true, cancelled: false });
+		expect(switchSession).toHaveBeenCalledWith("/tmp/example.jsonl", { cwdOverride: root });
 	});
 
 	it("restarts the protected default session without changing its web session id", async () => {

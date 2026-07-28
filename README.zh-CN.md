@@ -144,7 +144,11 @@ curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/prompt" \
 | `GET` | `/api/sessions/:id/messages` | 获取当前消息历史 |
 | `GET` | `/api/sessions/:id/entries?since=<id>` | 获取全部或增量会话条目 |
 | `GET` | `/api/sessions/:id/tree` | 获取会话分支树和当前叶节点 |
+| `GET` | `/api/sessions/:id/commands` | 获取扩展、提示模板和技能命令 |
+| `GET` | `/api/sessions/:id/fork-messages` | 获取可作为派生点的用户消息 |
+| `GET` | `/api/sessions/:id/last-assistant-text` | 获取最后一条助手文本 |
 | `PATCH` | `/api/sessions/:id` | 使用 `{ "name": "..." }` 重命名会话 |
+| `POST` | `/api/sessions/:id/switch` | 切换到 `{ "sessionPath": "...", "cwdOverride": "..." }` 指定的会话 |
 | `POST` | `/api/sessions/:id/clone` | 在当前活动叶节点克隆会话 |
 | `POST` | `/api/sessions/:id/restart` | 重建运行时，同时保持 Web 会话 ID 不变 |
 | `POST` | `/api/sessions/:id/export` | 将持久化会话导出为 HTML |
@@ -157,13 +161,24 @@ curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/prompt" \
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | `POST` | `/api/sessions/:id/prompt` | 提交 `{ "message": "..." }` |
+| `POST` | `/api/sessions/:id/steer` | 将 `{ "message": "...", "images": [...] }` 加入 steering 队列 |
+| `POST` | `/api/sessions/:id/follow-up` | 将消息加入当前轮次后的 follow-up 队列 |
 | `POST` | `/api/sessions/:id/abort` | 中止当前智能体运行 |
+| `POST` | `/api/sessions/:id/abort-bash` | 中止当前直接执行的 bash 命令 |
+| `POST` | `/api/sessions/:id/abort-retry` | 中止自动重试等待 |
 | `POST` | `/api/sessions/:id/bash` | 执行 shell 命令并返回结果 |
 | `POST` | `/api/sessions/:id/compact` | 压缩上下文并返回压缩结果 |
 | `POST` | `/api/sessions/:id/fork` | 在可选的 `entryId` 处派生会话 |
 | `GET` | `/api/models?session_id=<id>` | 列出已配置认证的模型 |
 | `POST` | `/api/sessions/:id/model` | 精确选择 `{ "provider": "...", "modelId": "..." }` |
+| `POST` | `/api/sessions/:id/cycle-model` | 向前或向后循环切换模型 |
 | `POST` | `/api/sessions/:id/thinking` | 设置 `off`、`minimal`、`low`、`medium`、`high` 或 `xhigh` |
+| `POST` | `/api/sessions/:id/cycle-thinking` | 循环切换当前模型支持的思考级别 |
+| `GET` | `/api/sessions/:id/thinking-levels` | 获取当前模型支持的思考级别 |
+| `PUT` | `/api/sessions/:id/steering-mode` | 将队列模式设为 `all` 或 `one-at-a-time` |
+| `PUT` | `/api/sessions/:id/follow-up-mode` | 设置 follow-up 队列模式 |
+| `PUT` | `/api/sessions/:id/auto-compaction` | 开启或关闭自动压缩 |
+| `PUT` | `/api/sessions/:id/auto-retry` | 开启或关闭自动重试 |
 
 提示请求使用按会话划分的 Token Bucket 进行限流，当前默认值为每分钟 30 次。
 
@@ -179,6 +194,8 @@ WebSocket 客户端还可以发送提示命令：
 ```json
 { "type": "prompt", "message": "运行相关测试。" }
 ```
+
+客户端也可以用 `{ "type": "abort" }` 中止当前智能体运行。扩展调用 `ctx.ui` 时，会通过同一连接发送限定在当前 session 的 `extension_ui_request`；客户端使用 `extension_ui_response` 响应阻塞式对话框。通知、状态、标题、编辑器文本和字符串数组 widget 无需响应。完整格式参见 [Web mode 协议](packages/coding-agent/docs/web-mode.md#extension-ui-protocol)。
 
 经过认证的 WebSocket 升级请求必须通过 HTTP Header 携带 `Authorization: Bearer <token>`。服务器会拒绝 URL query 中的 Token。Node 客户端和 `websocat` 等命令行客户端可以直接设置 Header：
 

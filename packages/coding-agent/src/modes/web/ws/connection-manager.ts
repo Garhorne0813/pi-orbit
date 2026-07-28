@@ -7,6 +7,7 @@
 
 import type { AgentSessionEvent } from "../../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../../core/agent-session-runtime.ts";
+import type { WsExtensionUIResponse } from "../types.ts";
 
 /** Minimal WebSocket-like interface for sending messages */
 export interface WebSocketLike {
@@ -19,6 +20,7 @@ interface SessionConnections {
 	clients: Set<WebSocketLike>;
 	runtime: AgentSessionRuntime;
 	unsubscribe: (() => void) | undefined;
+	pendingUIRequests: Map<string, (response: WsExtensionUIResponse) => boolean>;
 }
 
 export class ConnectionManager {
@@ -36,6 +38,7 @@ export class ConnectionManager {
 			clients: new Set(),
 			runtime,
 			unsubscribe: undefined,
+			pendingUIRequests: new Map(),
 		};
 		this._sessions.set(sessionId, connections);
 		runtime.setRebindSession(async () => {
@@ -71,7 +74,56 @@ export class ConnectionManager {
 		if (conn.clients.size === 0) {
 			conn.unsubscribe?.();
 			conn.unsubscribe = undefined;
+			this.cancelPendingUIRequests(conn);
 		}
+	}
+
+	sendToSession(sessionId: string, message: object): boolean {
+		const conn = this._sessions.get(sessionId);
+		if (!conn || conn.clients.size === 0) return false;
+		const serialized = JSON.stringify(message);
+		for (const client of conn.clients) {
+			try {
+				client.send(serialized);
+			} catch {
+				try {
+					client.close(1011, "Message delivery failed");
+				} catch {
+					// Ignore close failures for already-broken connections.
+				}
+				conn.clients.delete(client);
+			}
+		}
+		if (conn.clients.size === 0) this.cancelPendingUIRequests(conn);
+		return conn.clients.size > 0;
+	}
+
+	registerUIRequest(
+		sessionId: string,
+		requestId: string,
+		resolve: (response: WsExtensionUIResponse) => boolean,
+	): boolean {
+		const conn = this._sessions.get(sessionId);
+		if (!conn || conn.clients.size === 0) return false;
+		conn.pendingUIRequests.set(requestId, resolve);
+		return true;
+	}
+
+	resolveUIResponse(sessionId: string, response: WsExtensionUIResponse): boolean {
+		const conn = this._sessions.get(sessionId);
+		const resolve = conn?.pendingUIRequests.get(response.id);
+		if (!conn || !resolve) return false;
+		if (!resolve(response)) return false;
+		conn.pendingUIRequests.delete(response.id);
+		return true;
+	}
+
+	cancelUIRequest(sessionId: string, requestId: string): void {
+		this._sessions.get(sessionId)?.pendingUIRequests.delete(requestId);
+	}
+
+	getPendingUIRequests(sessionId: string): string[] {
+		return [...(this._sessions.get(sessionId)?.pendingUIRequests.keys() ?? [])];
 	}
 
 	removeSession(sessionId: string): void {
@@ -80,6 +132,7 @@ export class ConnectionManager {
 
 		conn.runtime.setRebindSession(undefined);
 		conn.unsubscribe?.();
+		this.cancelPendingUIRequests(conn);
 
 		for (const client of conn.clients) {
 			try {
@@ -94,6 +147,13 @@ export class ConnectionManager {
 
 	connectionCount(sessionId: string): number {
 		return this._sessions.get(sessionId)?.clients.size ?? 0;
+	}
+
+	private cancelPendingUIRequests(connections: SessionConnections): void {
+		for (const resolve of connections.pendingUIRequests.values()) {
+			resolve({ type: "extension_ui_response", id: "", cancelled: true });
+		}
+		connections.pendingUIRequests.clear();
 	}
 
 	private subscribeToCurrentSession(connections: SessionConnections): void {

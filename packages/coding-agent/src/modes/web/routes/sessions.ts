@@ -1,7 +1,12 @@
 /** Session management routes for web mode. */
 
 import type { Hono } from "hono";
-import { isCreateSessionRequest, isExportSessionRequest, isRenameSessionRequest } from "../types.ts";
+import {
+	isCreateSessionRequest,
+	isExportSessionRequest,
+	isRenameSessionRequest,
+	isSwitchSessionRequest,
+} from "../types.ts";
 import type { WebSessionHost } from "../web-session-host.ts";
 
 export interface SessionRoutesDeps {
@@ -100,6 +105,70 @@ export function registerSessionRoutes(app: Hono, deps: SessionRoutesDeps): void 
 		if (!entry) return context.json({ error: "Session not found" } as const, 404);
 		const sessionManager = entry.runtime.session.sessionManager;
 		return context.json({ tree: sessionManager.getTree(), leafId: sessionManager.getLeafId() });
+	});
+
+	app.get("/api/sessions/:id/commands", (context) => {
+		const entry = sessionHost.get(context.req.param("id"));
+		if (!entry) return context.json({ error: "Session not found" } as const, 404);
+		const session = entry.runtime.session;
+		return context.json({
+			commands: [
+				...session.extensionRunner.getRegisteredCommands().map((command) => ({
+					name: command.invocationName,
+					description: command.description,
+					source: "extension" as const,
+					sourceInfo: command.sourceInfo,
+				})),
+				...session.promptTemplates.map((template) => ({
+					name: template.name,
+					description: template.description,
+					source: "prompt" as const,
+					sourceInfo: template.sourceInfo,
+				})),
+				...session.resourceLoader.getSkills().skills.map((skill) => ({
+					name: `skill:${skill.name}`,
+					description: skill.description,
+					source: "skill" as const,
+					sourceInfo: skill.sourceInfo,
+				})),
+			],
+		});
+	});
+
+	app.get("/api/sessions/:id/fork-messages", (context) => {
+		const entry = sessionHost.get(context.req.param("id"));
+		if (!entry) return context.json({ error: "Session not found" } as const, 404);
+		return context.json({ messages: entry.runtime.session.getUserMessagesForForking() });
+	});
+
+	app.get("/api/sessions/:id/last-assistant-text", (context) => {
+		const entry = sessionHost.get(context.req.param("id"));
+		if (!entry) return context.json({ error: "Session not found" } as const, 404);
+		return context.json({ text: entry.runtime.session.getLastAssistantText() ?? null });
+	});
+
+	app.post("/api/sessions/:id/switch", async (context) => {
+		const entry = sessionHost.get(context.req.param("id"));
+		if (!entry) return context.json({ error: "Session not found" } as const, 404);
+		let body: unknown;
+		try {
+			body = await context.req.json();
+		} catch {
+			return context.json({ error: "Invalid JSON body" } as const, 400);
+		}
+		if (!isSwitchSessionRequest(body)) return context.json({ error: "Invalid switch request" } as const, 400);
+		try {
+			const result = await entry.runtime.switchSession(body.sessionPath, { cwdOverride: body.cwdOverride });
+			return context.json({ success: !result.cancelled, cancelled: result.cancelled });
+		} catch (error) {
+			return context.json(
+				{
+					error: "Failed to switch session",
+					details: error instanceof Error ? error.message : String(error),
+				} as const,
+				500,
+			);
+		}
 	});
 
 	app.patch("/api/sessions/:id", async (context) => {
