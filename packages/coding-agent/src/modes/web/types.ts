@@ -1,4 +1,5 @@
 import type { ImageContent } from "@earendil-works/pi-ai";
+import type { AgentSessionEvent } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 
 /**
@@ -15,6 +16,18 @@ export interface WebModeOptions {
 	authToken?: string;
 	/** Allowed CORS origin (default: PI_WEB_CORS_ORIGIN env var or *) */
 	corsOrigin?: string;
+	/** Maximum runtimes held by one web host, including the startup runtime. */
+	maxRuntimes?: number;
+	/** Evict inactive non-system runtimes after this many milliseconds. */
+	idleTimeoutMs?: number;
+	/** Maximum simultaneous agent turns across all runtimes. */
+	maxConcurrentTurns?: number;
+	/** Maximum HTTP API request body size. */
+	requestBodyLimitBytes?: number;
+	/** Maximum time to wait for one runtime to dispose. */
+	disposeTimeoutMs?: number;
+	/** Maximum time to wait for complete Web host shutdown. */
+	shutdownTimeoutMs?: number;
 }
 
 /** Session summary returned by list endpoints */
@@ -24,6 +37,79 @@ export interface SessionSummary {
 	cwd: string;
 	createdAt: number;
 	model: string | undefined;
+}
+
+/** Stable host handle plus the current persisted Pi session identity. */
+export interface RuntimeDescriptor {
+	runtimeId: string;
+	piSessionId: string;
+	sessionPath: string | null;
+	cwd: string;
+	createdAt: number;
+	lastActivityAt: number;
+	busy: boolean;
+	model: string | null;
+	thinking: string | null;
+	isStreaming: boolean;
+	isCompacting: boolean;
+}
+
+export interface CreateRuntimeRequest {
+	cwd: string;
+	sessionDir: string;
+	sessionPath?: string;
+	model?: string;
+	thinking?: string;
+}
+
+export interface ResumeRuntimeRequest {
+	sessionPath: string;
+	piSessionId?: string;
+	cwdOverride?: string;
+}
+
+export interface RuntimeCapabilities {
+	protocolVersion: 1;
+	piVersion: string;
+	isolationModel: "single-user-shared-process";
+	supportedCommands: readonly ["prompt", "abort", "compact", "fork", "model", "resume"];
+	supportsRuntimeEnvironment: false;
+	supportsSessionResume: true;
+	supportsEventSequence: true;
+	supportsExtensionUI: true;
+	features: {
+		runtimeApi: true;
+		eventReplay: true;
+		runtimeEnvironment: false;
+		runtimeResourceOverrides: false;
+		idleEviction: true;
+	};
+}
+
+export const RUNTIME_CAPABILITIES: Omit<RuntimeCapabilities, "piVersion"> = {
+	protocolVersion: 1,
+	isolationModel: "single-user-shared-process",
+	supportedCommands: ["prompt", "abort", "compact", "fork", "model", "resume"],
+	supportsRuntimeEnvironment: false,
+	supportsSessionResume: true,
+	supportsEventSequence: true,
+	supportsExtensionUI: true,
+	features: {
+		runtimeApi: true,
+		eventReplay: true,
+		runtimeEnvironment: false,
+		runtimeResourceOverrides: false,
+		idleEviction: true,
+	},
+};
+
+export interface RuntimeEventEnvelope {
+	protocolVersion: 1;
+	runtimeId: string;
+	piSessionId: string;
+	sequence: number;
+	timestamp: string;
+	event: AgentSessionEvent | WsExtensionUIRequest | { type: "runtime_evicted"; reason: "idle" };
 }
 
 /** Create session request body */
@@ -100,6 +186,16 @@ export interface SwitchSessionRequest {
 export interface HealthResponse {
 	status: "ok";
 	version: string;
+	protocolVersion: 1;
+	runtimeHost: {
+		runtimeCount: number;
+		busyRuntimeCount: number;
+		activeTurnCount: number;
+		maxRuntimes: number;
+		maxConcurrentTurns: number;
+		atCapacity: boolean;
+		bufferedEventCount: number;
+	};
 }
 
 /** API error response */
@@ -112,6 +208,7 @@ export interface ApiError {
 export interface WebSessionEntry {
 	runtime: AgentSessionRuntime;
 	createdAt: number;
+	lastActivityAt: number;
 	/** True for the default session seeded at startup (not disposable via DELETE) */
 	system?: boolean;
 }
@@ -178,6 +275,23 @@ export function isCreateSessionRequest(data: unknown): data is CreateSessionRequ
 		(object.cwd === undefined || typeof object.cwd === "string") &&
 		(object.name === undefined || typeof object.name === "string")
 	);
+}
+
+export function isCreateRuntimeRequest(data: unknown): data is CreateRuntimeRequest {
+	if (typeof data !== "object" || data === null) return false;
+	const object = data as Record<string, unknown>;
+	if (!hasNonEmptyString(object, "cwd") || !hasNonEmptyString(object, "sessionDir")) return false;
+	if (object.sessionPath !== undefined && !hasNonEmptyString(object, "sessionPath")) return false;
+	if (object.model !== undefined && !hasNonEmptyString(object, "model")) return false;
+	if (object.thinking !== undefined && !hasNonEmptyString(object, "thinking")) return false;
+	return object.runtimeEnv === undefined && object.skills === undefined && object.extensions === undefined;
+}
+
+export function isResumeRuntimeRequest(data: unknown): data is ResumeRuntimeRequest {
+	if (!hasNonEmptyString(data, "sessionPath")) return false;
+	const object = data as Record<string, unknown>;
+	if (object.piSessionId !== undefined && !hasNonEmptyString(object, "piSessionId")) return false;
+	return object.cwdOverride === undefined || hasNonEmptyString(object, "cwdOverride");
 }
 
 export function isPromptRequest(data: unknown): data is PromptRequest {

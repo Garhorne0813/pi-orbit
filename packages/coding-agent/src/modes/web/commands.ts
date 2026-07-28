@@ -22,10 +22,10 @@ export type WebCommand =
 	| { type: "set_auto_retry"; enabled: boolean };
 
 export class WebCommandError extends Error {
-	readonly status: 400 | 404 | 500;
+	readonly status: 400 | 404 | 429 | 500;
 	readonly details: string | undefined;
 
-	constructor(message: string, status: 400 | 404 | 500, details?: string) {
+	constructor(message: string, status: 400 | 404 | 429 | 500, details?: string) {
 		super(message);
 		this.name = "WebCommandError";
 		this.status = status;
@@ -50,6 +50,9 @@ export class WebCommandHandler {
 		try {
 			switch (command.type) {
 				case "prompt":
+					if (!this.sessionHost.tryAcquireAgentTurn(sessionId)) {
+						throw new WebCommandError("Agent turn capacity exceeded", 429);
+					}
 					await new Promise<void>((resolve, reject) => {
 						let preflightSucceeded = false;
 						void runtime.session
@@ -67,7 +70,8 @@ export class WebCommandHandler {
 								} else {
 									reject(error);
 								}
-							});
+							})
+							.finally(() => this.sessionHost.releaseAgentTurn(sessionId));
 					});
 					return { success: true };
 				case "abort":

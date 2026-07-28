@@ -23,6 +23,12 @@ export interface ResolvedWebModeOptions {
 	host: string;
 	authToken: string | undefined;
 	corsOrigin: string;
+	maxRuntimes: number;
+	idleTimeoutMs: number;
+	maxConcurrentTurns: number;
+	requestBodyLimitBytes: number;
+	disposeTimeoutMs: number;
+	shutdownTimeoutMs: number;
 }
 
 export function resolveWebModeOptions(
@@ -34,12 +40,57 @@ export function resolveWebModeOptions(
 		throw new Error(`Invalid web port: ${environment.PI_WEB_PORT ?? String(rawPort)}`);
 	}
 	const rawToken = options.authToken ?? environment.PI_WEB_AUTH_TOKEN;
+	const authToken = rawToken && rawToken.length > 0 ? rawToken : undefined;
+	const host = options.host ?? environment.PI_WEB_HOST ?? "127.0.0.1";
+	const corsOrigin = options.corsOrigin ?? environment.PI_WEB_CORS_ORIGIN ?? "*";
+	if (!isLoopbackHost(host) && authToken === undefined) {
+		throw new Error("Authentication is required for non-loopback web hosts");
+	}
+	if (!isLoopbackHost(host) && corsOrigin === "*") {
+		throw new Error("An explicit CORS origin is required for non-loopback web hosts");
+	}
+	const maxRuntimes = options.maxRuntimes ?? Number(environment.PI_WEB_MAX_RUNTIMES ?? "64");
+	const idleTimeoutMs = options.idleTimeoutMs ?? Number(environment.PI_WEB_IDLE_TIMEOUT_MS ?? String(30 * 60_000));
+	const maxConcurrentTurns = options.maxConcurrentTurns ?? Number(environment.PI_WEB_MAX_CONCURRENT_TURNS ?? "4");
+	const requestBodyLimitBytes =
+		options.requestBodyLimitBytes ?? Number(environment.PI_WEB_REQUEST_BODY_LIMIT_BYTES ?? String(4 * 1024 * 1024));
+	const disposeTimeoutMs =
+		options.disposeTimeoutMs ?? Number(environment.PI_WEB_RUNTIME_DISPOSE_TIMEOUT_MS ?? "10000");
+	const shutdownTimeoutMs = options.shutdownTimeoutMs ?? Number(environment.PI_WEB_SHUTDOWN_TIMEOUT_MS ?? "15000");
+	if (!Number.isInteger(maxRuntimes) || maxRuntimes < 1) {
+		throw new Error(`Invalid maximum runtime count: ${maxRuntimes}`);
+	}
+	if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) {
+		throw new Error(`Invalid runtime idle timeout: ${idleTimeoutMs}`);
+	}
+	if (!Number.isInteger(maxConcurrentTurns) || maxConcurrentTurns < 1) {
+		throw new Error(`Invalid maximum concurrent turn count: ${maxConcurrentTurns}`);
+	}
+	if (!Number.isInteger(requestBodyLimitBytes) || requestBodyLimitBytes < 1) {
+		throw new Error(`Invalid request body limit: ${requestBodyLimitBytes}`);
+	}
+	if (!Number.isFinite(disposeTimeoutMs) || disposeTimeoutMs <= 0) {
+		throw new Error(`Invalid runtime dispose timeout: ${disposeTimeoutMs}`);
+	}
+	if (!Number.isFinite(shutdownTimeoutMs) || shutdownTimeoutMs <= 0) {
+		throw new Error(`Invalid shutdown timeout: ${shutdownTimeoutMs}`);
+	}
 	return {
 		port: rawPort,
-		host: options.host ?? environment.PI_WEB_HOST ?? "127.0.0.1",
-		authToken: rawToken && rawToken.length > 0 ? rawToken : undefined,
-		corsOrigin: options.corsOrigin ?? environment.PI_WEB_CORS_ORIGIN ?? "*",
+		host,
+		authToken,
+		corsOrigin,
+		maxRuntimes,
+		idleTimeoutMs,
+		maxConcurrentTurns,
+		requestBodyLimitBytes,
+		disposeTimeoutMs,
+		shutdownTimeoutMs,
 	};
+}
+
+function isLoopbackHost(host: string): boolean {
+	return host === "localhost" || host === "::1" || host === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(host);
 }
 
 export async function runWebMode(defaultRuntime: AgentSessionRuntime, options: RunWebModeOptions): Promise<never> {
@@ -48,10 +99,15 @@ export async function runWebMode(defaultRuntime: AgentSessionRuntime, options: R
 	const defaultSessionManager = defaultRuntime.session.sessionManager;
 	const createSessionManager =
 		options.createSessionManager ??
-		((cwd: string) =>
-			defaultSessionManager.isPersisted()
+		((cwd: string, runtimeOptions?: { sessionDir?: string; sessionPath?: string }) => {
+			if (runtimeOptions?.sessionPath) {
+				return SessionManager.open(runtimeOptions.sessionPath, runtimeOptions.sessionDir, cwd);
+			}
+			if (runtimeOptions?.sessionDir) return SessionManager.create(cwd, runtimeOptions.sessionDir);
+			return defaultSessionManager.isPersisted()
 				? SessionManager.create(cwd, defaultSessionManager.getSessionDir())
-				: SessionManager.inMemory(cwd));
+				: SessionManager.inMemory(cwd);
+		});
 	const sessionHost = new WebSessionHost({
 		defaultRuntime,
 		connectionManager,
@@ -62,12 +118,22 @@ export async function runWebMode(defaultRuntime: AgentSessionRuntime, options: R
 				agentDir: options.agentDir,
 				sessionManager,
 			}),
+		maxRuntimes: config.maxRuntimes,
+		idleTimeoutMs: config.idleTimeoutMs,
+		maxConcurrentTurns: config.maxConcurrentTurns,
+		disposeTimeoutMs: config.disposeTimeoutMs,
 	});
 	await sessionHost.initialize();
 
 	const accessPolicy = new WebAccessPolicy(config.authToken);
 	const serverHost = new WebServerHost(
-		createApp({ sessionHost, connectionManager, accessPolicy, corsOrigin: config.corsOrigin }),
+		createApp({
+			sessionHost,
+			connectionManager,
+			accessPolicy,
+			corsOrigin: config.corsOrigin,
+			requestBodyLimitBytes: config.requestBodyLimitBytes,
+		}),
 	);
 	let shuttingDown = false;
 	let removeServerErrorHandler = () => {};
@@ -78,8 +144,7 @@ export async function runWebMode(defaultRuntime: AgentSessionRuntime, options: R
 		removeServerErrorHandler();
 		for (const [signal, handler] of signalHandlers) process.off(signal, handler);
 		console.error("\n[web] Shutting down...");
-		await serverHost.close();
-		await sessionHost.dispose();
+		await waitForShutdown(Promise.all([serverHost.close(), sessionHost.dispose()]), config.shutdownTimeoutMs);
 		process.exit(exitCode);
 	};
 	const requestCleanup = (exitCode: number): void => {
@@ -121,4 +186,19 @@ export async function runWebMode(defaultRuntime: AgentSessionRuntime, options: R
 	}
 
 	return new Promise<never>(() => {});
+}
+
+async function waitForShutdown(shutdown: Promise<unknown>, timeoutMs: number): Promise<void> {
+	let timeout: NodeJS.Timeout | undefined;
+	await Promise.race([
+		shutdown,
+		new Promise<void>((resolve) => {
+			timeout = setTimeout(() => {
+				console.error(`[web] Shutdown timed out after ${timeoutMs}ms`);
+				resolve();
+			}, timeoutMs);
+			timeout.unref();
+		}),
+	]);
+	if (timeout) clearTimeout(timeout);
 }

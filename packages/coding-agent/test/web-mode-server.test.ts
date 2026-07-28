@@ -19,7 +19,7 @@ import { createApp, WebServerHost } from "../src/modes/web/server.ts";
 import { createWebExtensionUIContext } from "../src/modes/web/ui-context.ts";
 import { resolveWebModeOptions } from "../src/modes/web/web-mode.ts";
 import { WebSessionHost } from "../src/modes/web/web-session-host.ts";
-import { ConnectionManager } from "../src/modes/web/ws/connection-manager.ts";
+import { ConnectionManager, type WebSocketLike } from "../src/modes/web/ws/connection-manager.ts";
 
 describe("web mode server", () => {
 	const cleanups: Array<() => Promise<void> | void> = [];
@@ -36,11 +36,13 @@ describe("web mode server", () => {
 			corsOrigin?: string;
 			heartbeatIntervalMs?: number;
 			persistedSession?: boolean;
+			maxConcurrentTurns?: number;
+			requestBodyLimitBytes?: number;
 		} = {},
 	) {
 		const root = join(tmpdir(), `pi-web-server-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(root, { recursive: true });
-		const faux = registerFauxProvider();
+		const faux = registerFauxProvider({ models: [{ id: "faux-1", reasoning: true }] });
 		faux.setResponses([fauxAssistantMessage("websocket response"), fauxAssistantMessage("http response")]);
 		const authStorage = AuthStorage.inMemory();
 		if (options.configureApiKey !== false) {
@@ -109,7 +111,13 @@ describe("web mode server", () => {
 			connectionManager,
 			createRuntime: (cwd, sessionManager) =>
 				createAgentSessionRuntime(factory, { cwd, agentDir: root, sessionManager }),
-			createSessionManager: (cwd) => SessionManager.inMemory(cwd),
+			createSessionManager: (cwd, runtimeOptions) =>
+				runtimeOptions?.sessionPath
+					? SessionManager.open(runtimeOptions.sessionPath, runtimeOptions.sessionDir, cwd)
+					: runtimeOptions?.sessionDir
+						? SessionManager.create(cwd, runtimeOptions.sessionDir)
+						: SessionManager.inMemory(cwd),
+			maxConcurrentTurns: options.maxConcurrentTurns,
 		});
 		await sessionHost.initialize();
 		const serverHost = new WebServerHost(
@@ -119,6 +127,7 @@ describe("web mode server", () => {
 				accessPolicy: new WebAccessPolicy(options.authToken),
 				promptRateLimit: options.promptRateLimit,
 				corsOrigin: options.corsOrigin,
+				requestBodyLimitBytes: options.requestBodyLimitBytes,
 			}),
 			{ heartbeatIntervalMs: options.heartbeatIntervalMs },
 		);
@@ -167,6 +176,151 @@ describe("web mode server", () => {
 		authorized.close();
 	});
 
+	it("exposes the versioned runtime host contract and distinct runtime identities", async () => {
+		const { baseUrl, sessionHost, root } = await createHarness();
+
+		const capabilities = await fetch(`${baseUrl}/api/capabilities`);
+		expect(capabilities.status).toBe(200);
+		expect(await capabilities.json()).toMatchObject({
+			protocolVersion: 1,
+			features: {
+				runtimeApi: true,
+				eventReplay: true,
+				runtimeEnvironment: false,
+			},
+		});
+
+		const listed = await fetch(`${baseUrl}/api/runtimes`);
+		expect(listed.status).toBe(200);
+		expect(await listed.json()).toEqual([
+			expect.objectContaining({
+				runtimeId: sessionHost.defaultSessionId,
+				piSessionId: sessionHost.get(sessionHost.defaultSessionId)?.runtime.session.sessionId,
+			}),
+		]);
+
+		const created = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ cwd: root, sessionDir: join(root, "runtime-sessions") }),
+		});
+		expect(created.status).toBe(201);
+		const descriptor = (await created.json()) as {
+			runtimeId: string;
+			piSessionId: string;
+			sessionPath: string | null;
+		};
+		expect(descriptor.runtimeId).not.toBe(descriptor.piSessionId);
+		expect(descriptor.sessionPath).toContain(join(root, "runtime-sessions"));
+
+		const fetched = await fetch(`${baseUrl}/api/runtimes/${descriptor.runtimeId}`);
+		expect(fetched.status).toBe(200);
+		expect(await fetched.json()).toMatchObject(descriptor);
+	});
+
+	it("reports runtime capacity, activity, and event buffer metrics in health checks", async () => {
+		const { baseUrl } = await createHarness({ maxConcurrentTurns: 2 });
+		const response = await fetch(`${baseUrl}/api/health`);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({
+			status: "ok",
+			protocolVersion: 1,
+			runtimeHost: {
+				runtimeCount: 1,
+				busyRuntimeCount: 0,
+				activeTurnCount: 0,
+				maxRuntimes: 64,
+				maxConcurrentTurns: 2,
+				atCapacity: false,
+				bufferedEventCount: 0,
+			},
+		});
+	});
+
+	it("executes runtime commands with both identities and resumes an explicit session path", async () => {
+		const { baseUrl, root } = await createHarness();
+		const create = () =>
+			fetch(`${baseUrl}/api/runtimes`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ cwd: root, sessionDir: join(root, "runtime-sessions") }),
+			});
+		const source = (await (await create()).json()) as {
+			runtimeId: string;
+			piSessionId: string;
+			sessionPath: string;
+		};
+		const prompt = await fetch(`${baseUrl}/api/runtimes/${source.runtimeId}/prompt`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ message: "persist me" }),
+		});
+		expect(prompt.status).toBe(202);
+		expect(await prompt.json()).toMatchObject({
+			success: true,
+			runtimeId: source.runtimeId,
+			piSessionId: source.piSessionId,
+		});
+
+		const target = (await (await create()).json()) as { runtimeId: string; piSessionId: string };
+		const resumed = await fetch(`${baseUrl}/api/runtimes/${target.runtimeId}/resume`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ sessionPath: source.sessionPath, piSessionId: source.piSessionId }),
+		});
+		expect(resumed.status).toBe(200);
+		expect(await resumed.json()).toMatchObject({
+			runtimeId: target.runtimeId,
+			piSessionId: source.piSessionId,
+			sessionPath: source.sessionPath,
+		});
+	});
+
+	it("applies explicit model and thinking settings while creating a runtime", async () => {
+		const { baseUrl, sessionHost, root } = await createHarness();
+		const defaultRuntime = sessionHost.get(sessionHost.defaultSessionId)?.runtime;
+		const model = (await defaultRuntime?.services.modelRuntime.getAvailable())?.[0];
+		if (!model) throw new Error("missing model");
+
+		const response = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				cwd: root,
+				sessionDir: join(root, "runtime-sessions"),
+				model: `${model.provider}/${model.id}`,
+				thinking: "high",
+			}),
+		});
+
+		expect(response.status).toBe(201);
+		expect(await response.json()).toMatchObject({ model: model.id, thinking: "high" });
+	});
+
+	it("uses process-level resources and rejects runtime-scoped environment or extension overrides", async () => {
+		const { baseUrl, root } = await createHarness();
+		const capabilities = await fetch(`${baseUrl}/api/capabilities`);
+		expect(await capabilities.json()).toMatchObject({
+			isolationModel: "single-user-shared-process",
+			supportsRuntimeEnvironment: false,
+			features: { runtimeResourceOverrides: false },
+		});
+
+		for (const override of [
+			{ runtimeEnv: { TEST_KEY: "value" } },
+			{ skills: ["/tmp/skill"] },
+			{ extensions: ["/tmp/extension.ts"] },
+		]) {
+			const response = await fetch(`${baseUrl}/api/runtimes`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ cwd: root, sessionDir: join(root, "runtime-sessions"), ...override }),
+			});
+			expect(response.status).toBe(400);
+		}
+	});
+
 	it("streams events through the maintained WebSocket adapter after accepting a command", async () => {
 		const { wsUrl, sessionHost } = await createHarness();
 		const websocket = new WebSocket(`${wsUrl}/ws?session_id=${sessionHost.defaultSessionId}`);
@@ -203,6 +357,35 @@ describe("web mode server", () => {
 		});
 
 		await expect(ui.confirm("Permission", "Continue?")).resolves.toBe(true);
+	});
+
+	it("accepts extension UI responses over the runtime HTTP API", async () => {
+		const { baseUrl, sessionHost, connectionManager } = await createHarness();
+		const runtimeId = sessionHost.defaultSessionId;
+		const client: WebSocketLike = { send: () => {}, close: () => {} };
+		connectionManager.register(runtimeId, client, { eventFormat: "envelope" });
+		const resolved = new Promise<boolean>((resolve) => {
+			connectionManager.registerUIRequest(runtimeId, "request-1", (response) => {
+				if (!("confirmed" in response)) return false;
+				resolve(response.confirmed);
+				return true;
+			});
+		});
+
+		const response = await fetch(`${baseUrl}/api/runtimes/${runtimeId}/ui-response`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ type: "extension_ui_response", id: "request-1", confirmed: true }),
+		});
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({
+			success: true,
+			runtimeId,
+			piSessionId: sessionHost.get(runtimeId)?.runtime.session.sessionId,
+		});
+		await expect(resolved).resolves.toBe(true);
+		connectionManager.unregister(runtimeId, client);
 	});
 
 	it("handles extension UI fallback, timeout, abort, and fire-and-forget messages", async () => {
@@ -308,6 +491,31 @@ describe("web mode server", () => {
 			received += new TextDecoder().decode(chunk.value);
 		}
 		await reader.cancel();
+		expect(received).toContain("websocket response");
+	});
+
+	it("replays buffered runtime events after Last-Event-ID", async () => {
+		const { baseUrl, sessionHost } = await createHarness();
+		const runtimeId = sessionHost.defaultSessionId;
+		await sessionHost.get(runtimeId)?.runtime.session.prompt("before-connect");
+
+		const response = await fetch(`${baseUrl}/api/runtimes/${runtimeId}/events`, {
+			headers: { "Last-Event-ID": "0" },
+		});
+		expect(response.status).toBe(200);
+		const reader = response.body?.getReader();
+		if (!reader) throw new Error("missing runtime SSE response body");
+		let received = "";
+		while (!received.includes("websocket response")) {
+			const chunk = await reader.read();
+			if (chunk.done) break;
+			received += new TextDecoder().decode(chunk.value);
+		}
+		await reader.cancel();
+
+		expect(received).toContain("event: runtime_event");
+		expect(received).toContain("id: 1");
+		expect(received).toContain(`"runtimeId":"${runtimeId}"`);
 		expect(received).toContain("websocket response");
 	});
 
@@ -476,6 +684,41 @@ describe("web mode server", () => {
 		expect((await request()).status).toBe(429);
 	});
 
+	it("limits concurrent agent turns across runtimes and releases capacity when a turn ends", async () => {
+		const { baseUrl, sessionHost, root } = await createHarness({ maxConcurrentTurns: 1 });
+		const firstRuntimeId = sessionHost.defaultRuntimeId;
+		const created = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ cwd: root, sessionDir: join(root, "turn-sessions") }),
+		});
+		const { runtimeId: secondRuntimeId } = (await created.json()) as { runtimeId: string };
+		const firstSession = sessionHost.get(firstRuntimeId)?.runtime.session;
+		if (!firstSession) throw new Error("missing first runtime");
+		let finishTurn = () => {};
+		vi.spyOn(firstSession, "prompt").mockImplementation((_message, options) => {
+			options?.preflightResult?.(true);
+			return new Promise<void>((resolve) => {
+				finishTurn = resolve;
+			});
+		});
+
+		const prompt = (runtimeId: string) =>
+			fetch(`${baseUrl}/api/runtimes/${runtimeId}/prompt`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ message: "run" }),
+			});
+		expect((await prompt(firstRuntimeId)).status).toBe(202);
+		const rejected = await prompt(secondRuntimeId);
+		expect(rejected.status).toBe(429);
+		expect(await rejected.json()).toMatchObject({ code: "agent_turn_capacity_exceeded" });
+
+		finishTurn();
+		await vi.waitFor(() => expect(sessionHost.activeTurnCount).toBe(0));
+		expect((await prompt(secondRuntimeId)).status).toBe(202);
+	});
+
 	it("exposes session state, history, tree, statistics, and renaming APIs", async () => {
 		const { baseUrl, sessionHost } = await createHarness();
 		const sessionId = sessionHost.defaultSessionId;
@@ -575,11 +818,47 @@ describe("web mode server", () => {
 			"https://control.example",
 		);
 		expect(() => resolveWebModeOptions({}, { PI_WEB_PORT: "invalid" })).toThrow("Invalid web port");
+		expect(
+			resolveWebModeOptions(
+				{},
+				{
+					PI_WEB_RUNTIME_DISPOSE_TIMEOUT_MS: "2500",
+					PI_WEB_SHUTDOWN_TIMEOUT_MS: "5000",
+				},
+			),
+		).toMatchObject({ disposeTimeoutMs: 2500, shutdownTimeoutMs: 5000 });
+	});
+
+	it("requires authentication and an explicit CORS origin on non-loopback hosts", () => {
+		expect(() => resolveWebModeOptions({ host: "0.0.0.0" }, {})).toThrow(
+			"Authentication is required for non-loopback web hosts",
+		);
+		expect(() => resolveWebModeOptions({ host: "0.0.0.0", authToken: "secret" }, {})).toThrow(
+			"An explicit CORS origin is required for non-loopback web hosts",
+		);
+		expect(
+			resolveWebModeOptions({ host: "0.0.0.0", authToken: "secret", corsOrigin: "https://control.example" }, {}),
+		).toMatchObject({ host: "0.0.0.0", authToken: "secret", corsOrigin: "https://control.example" });
 	});
 
 	it("uses the configured CORS origin", async () => {
 		const { baseUrl } = await createHarness({ corsOrigin: "https://control.example" });
 		const response = await fetch(`${baseUrl}/api/health`, { headers: { Origin: "https://control.example" } });
 		expect(response.headers.get("access-control-allow-origin")).toBe("https://control.example");
+	});
+
+	it("rejects API request bodies that exceed the configured limit", async () => {
+		const { baseUrl } = await createHarness({ requestBodyLimitBytes: 128 });
+		const response = await fetch(`${baseUrl}/api/sessions`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ name: "x".repeat(256) }),
+		});
+
+		expect(response.status).toBe(413);
+		expect(await response.json()).toEqual({
+			error: "Request body too large",
+			code: "request_body_too_large",
+		});
 	});
 });

@@ -13,8 +13,14 @@ pi --mode web [--port 3000] [--host 127.0.0.1] [--auth-token <token>]
 | `--port <port>` | `3000` or `PI_WEB_PORT` | HTTP server port (1–65535) |
 | `--host <host>` | `127.0.0.1` or `PI_WEB_HOST` | Bind address |
 | `--auth-token <token>` | `PI_WEB_AUTH_TOKEN` | Bearer token for API authentication |
+| `PI_WEB_MAX_RUNTIMES` | `64` | Maximum hosted runtimes, including the startup runtime |
+| `PI_WEB_MAX_CONCURRENT_TURNS` | `4` | Maximum simultaneous model turns across all runtimes |
+| `PI_WEB_IDLE_TIMEOUT_MS` | `1800000` | Idle timeout for recoverable persisted runtimes |
+| `PI_WEB_REQUEST_BODY_LIMIT_BYTES` | `4194304` | Maximum HTTP API request body size |
+| `PI_WEB_RUNTIME_DISPOSE_TIMEOUT_MS` | `10000` | Maximum wait for one runtime to dispose |
+| `PI_WEB_SHUTDOWN_TIMEOUT_MS` | `15000` | Maximum graceful shutdown time |
 
-When no auth token is configured, the API is open to all connections (dev mode). For production, always set `--auth-token` or the `PI_WEB_AUTH_TOKEN` environment variable.
+Loopback development can run without authentication. A non-loopback host requires both `--auth-token`/`PI_WEB_AUTH_TOKEN` and an explicit `PI_WEB_CORS_ORIGIN`; otherwise startup fails.
 
 ## Architecture
 
@@ -23,7 +29,7 @@ Browser / Web App / Mobile
         │
         ├── REST (HTTP) ──── CRUD sessions, prompt, models, tools
         │
-        └── WebSocket ────── Real-time AgentSessionEvent stream
+        └── SSE / WebSocket ─ Runtime events and extension UI
                 │
         ┌───────┴────────┐
         │  Web Mode        │
@@ -46,7 +52,7 @@ Web mode is a transport layer. All agent logic — prompting, tool execution, mo
 | `WebServerHost` | `modes/web/server.ts` | Testable Node.js server lifecycle using the maintained Hono Node and `ws` adapters. |
 | `WebSessionHost` | `modes/web/web-session-host.ts` | Owns session creation, isolation, extension rebinding, deletion, and disposal. |
 | `WebCommandHandler` | `modes/web/commands.ts` | Shared command semantics for REST and WebSocket adapters. |
-| `ConnectionManager` | `modes/web/ws/connection-manager.ts` | Runtime-aware event fan-out, per-session extension UI requests, and response correlation. |
+| `ConnectionManager` | `modes/web/ws/connection-manager.ts` | Permanent runtime event subscriptions, bounded replay buffers, fan-out, and extension UI response correlation. |
 | `createWebExtensionUIContext()` | `modes/web/ui-context.ts` | Adapts extension `ctx.ui` calls to session-scoped WebSocket messages. |
 | `WebAccessPolicy` | `modes/web/middleware/auth.ts` | Shared HTTP and WebSocket authentication with constant-time token comparison. |
 
@@ -58,9 +64,62 @@ Each session maps to a dedicated `AgentSessionRuntime` instance. The session lif
 2. **Dynamic sessions**: Created via `POST /api/sessions`. Each gets its own `SessionManager` and `AgentSessionRuntime`. Extensions are bound in `"web"` mode.
 3. **Deletion**: `DELETE /api/sessions/:id` closes all WebSocket connections, removes the dynamic entry from the session host, and disposes its runtime.
 4. **Switching**: `POST /api/sessions/:id/switch` replaces the runtime's current session while preserving the Web session ID and rebinding extensions and event subscriptions.
-5. **WebSocket lifecycle**: Connecting via `ws://host:port/ws?session_id=<id>` subscribes to that runtime's current `AgentSessionEvent` stream. Multiple clients can connect to the same session.
+5. **Event lifecycle**: The host subscribes when a runtime is registered, so events continue to receive sequence numbers while no client is connected. Clients can reconnect through the runtime SSE endpoint and replay the bounded in-memory buffer.
+6. **Idle eviction**: A dynamic runtime is eligible only when it is not streaming, compacting, or holding pending messages and its persisted JSONL file already exists. In-memory and not-yet-flushed sessions are never automatically evicted. The old handle returns `runtime_evicted` instead of an ambiguous 404.
 
 ## REST API
+
+### Runtime Host
+
+The runtime API is intended for control planes. It separates the process-local `runtimeId` from the persisted `piSessionId`; a fork, new session, or resume may change the latter while the runtime handle remains stable.
+
+Create a runtime:
+
+```json
+{
+  "cwd": "/workspace/project",
+  "sessionDir": "/workspace/state/sessions",
+  "sessionPath": "/workspace/state/sessions/existing.jsonl",
+  "model": "anthropic/claude-sonnet-5",
+  "thinking": "high"
+}
+```
+
+`sessionPath`, `model`, and `thinking` are optional. Environment variables, Provider credentials, `agentDir`, skills, extensions, and MCP configuration are process-level resources shared by every runtime. Requests containing runtime-scoped `runtimeEnv`, `skills`, or `extensions` are invalid. Stateful or cwd-dependent MCP servers should use separate connections per runtime even when their configuration is shared.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/api/runtimes` | Create a runtime from explicit directories and an optional session path. |
+| `GET` | `/api/runtimes` | List runtime descriptors. |
+| `GET` | `/api/runtimes/:runtimeId` | Read identity, path, model, activity, and busy state. |
+| `DELETE` | `/api/runtimes/:runtimeId` | Dispose a dynamic runtime without deleting session storage. |
+| `POST` | `/api/runtimes/:runtimeId/resume` | Resume `{ sessionPath, piSessionId?, cwdOverride? }`; an identity mismatch returns HTTP 409. |
+| `POST` | `/api/runtimes/:runtimeId/prompt` | Submit `{ message }`; returns HTTP 202 with both IDs. |
+| `POST` | `/api/runtimes/:runtimeId/abort` | Abort the active turn. |
+| `POST` | `/api/runtimes/:runtimeId/compact` | Compact the current context. |
+| `POST` | `/api/runtimes/:runtimeId/fork` | Fork at an optional `entryId`. |
+| `POST` | `/api/runtimes/:runtimeId/model` | Select `{ provider, modelId }` exactly. |
+| `POST` | `/api/runtimes/:runtimeId/ui-response` | Resolve a pending `extension_ui_response` without WebSocket client commands. |
+| `GET` | `/api/runtimes/:runtimeId/events` | Stream versioned event envelopes with replay support. |
+| `GET` | `/api/runtimes/:runtimeId/health` | Read runtime health and protocol version. |
+
+A runtime descriptor contains:
+
+```json
+{
+  "runtimeId": "process-local-uuid",
+  "piSessionId": "persisted-session-id",
+  "sessionPath": "/workspace/state/sessions/session.jsonl",
+  "cwd": "/workspace/project",
+  "createdAt": 1770000000000,
+  "lastActivityAt": 1770000000000,
+  "busy": false,
+  "model": "claude-sonnet-5",
+  "thinking": "high",
+  "isStreaming": false,
+  "isCompacting": false
+}
+```
 
 ### Session Management
 
@@ -117,11 +176,33 @@ Each session maps to a dedicated `AgentSessionRuntime` instance. The session lif
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/health` | Health check. Returns `{ "status": "ok", "version": "<current>" }`. No auth required. |
+| `GET` | `/api/health` | Health check with version, runtime counts, busy/active turns, capacity, and buffered-event usage. No auth required. |
+| `GET` | `/api/capabilities` | Protocol version, Pi version, supported runtime commands, and isolation capabilities. No auth required. |
 
 ### Responses
 
 All endpoints return JSON. Success responses use HTTP 2xx with a `success` field or the requested data. Errors use 4xx/5xx with `{ "error": "...", "details": "..." }`.
+
+Runtime endpoints also return stable error codes. `runtime_not_found` means the handle was never known, `runtime_evicted` means idle eviction removed it, `runtime_capacity_exceeded` means the host reached its configured limit, and `event_replay_gap` means the requested event sequence has left the ring buffer.
+
+Prompt endpoints also enforce a host-wide active-turn limit. When the limit is reached, new prompts return HTTP 429 with `agent_turn_capacity_exceeded`; capacity is released when the running prompt finishes or fails. HTTP API bodies larger than `PI_WEB_REQUEST_BODY_LIMIT_BYTES` return HTTP 413 with `request_body_too_large`.
+
+## Runtime Event Protocol
+
+`GET /api/runtimes/:runtimeId/events` emits SSE records named `runtime_event`. Each data field is a versioned envelope:
+
+```json
+{
+  "protocolVersion": 1,
+  "runtimeId": "runtime-uuid",
+  "piSessionId": "pi-session-id",
+  "sequence": 42,
+  "timestamp": "2026-07-28T12:00:00.000Z",
+  "event": { "type": "message_update" }
+}
+```
+
+Sequence numbers increase monotonically per runtime and continue across session replacement. The bounded buffer keeps the latest 512 events by default. Reconnect with `Last-Event-ID: <sequence>` or `?after=<sequence>`. If the sequence predates the buffer, the endpoint returns HTTP 409 with the available sequence window; durable persistence and state reconciliation remain the control plane's responsibility.
 
 ## WebSocket Protocol
 
@@ -192,7 +273,7 @@ The client responds on the same session connection. Depending on the method, use
 | `editor` | `{ value }` or `{ cancelled: true }` | Returns edited text or `undefined`. |
 | `notify`, `setStatus`, `setTitle`, `set_editor_text`, `setWidget` | none | Fire-and-forget UI update. Widgets support string arrays only. |
 
-Requests and responses are isolated by Web session. If several clients share a session, the first valid response wins. Responses from another session or for an expired request are rejected. Dialogs return their safe default when there is no client, the timeout expires, the supplied `AbortSignal` fires, the final client disconnects, or the session is removed.
+Requests and responses are isolated by runtime. If several clients share a runtime, the first valid response wins. Responses from another runtime or for an expired request are rejected. A control plane consuming runtime SSE can post the same response object to `/api/runtimes/:runtimeId/ui-response`. Dialogs return their safe default when there is no client, the timeout expires, the supplied `AbortSignal` fires, the final client disconnects, or the runtime is removed.
 
 ## Examples
 
@@ -253,7 +334,7 @@ The built-in token is process-wide authentication, not tenant authorization. For
 
 1. **Process isolation**: Run one Pi process or container per trust domain. Do not expose one process directly to mutually untrusted tenants.
 2. **Session isolation**: Each `POST /api/sessions` creates an isolated `SessionManager` and `AgentSessionRuntime` within that process.
-3. **Resource limits**: Monitor session count via `GET /api/sessions`. Implement rate limiting and session caps at the reverse proxy (nginx, Caddy) or in middleware.
+3. **Resource limits**: Monitor runtime count and active turns via `GET /api/health`. Configure `PI_WEB_MAX_RUNTIMES`, `PI_WEB_MAX_CONCURRENT_TURNS`, and `PI_WEB_IDLE_TIMEOUT_MS`, and enforce process-level CPU and memory limits externally.
 4. **Containerization**: Run each Pi instance in a container. See [containerization.md](containerization.md) for patterns.
 
 ## WebSocket Implementation
@@ -263,6 +344,6 @@ WebSocket upgrades and framing use `@hono/node-server` with `ws`. Web mode owns 
 ## Limitations
 
 - **No built-in TLS**: Use a reverse proxy (nginx, Caddy) for HTTPS.
-- **No request size limit**: Large request bodies are streamed through `ReadableStream`. Add body size limits at the reverse proxy for production.
-- **In-memory session map**: Session state is lost on process restart. Sessions persisted to disk via `SessionManager` can be recovered, but the web mode session map is ephemeral.
+- **Shared process resources**: Environment variables, Provider credentials, agent resources, and MCP configuration are shared. The host targets one user and one trust domain, not mutually untrusted tenants.
+- **In-memory runtime handles and replay**: Runtime IDs and the 512-event buffers are lost on process restart. Persisted JSONL sessions can be resumed with a new runtime ID.
 - **Single-process**: One `pi --mode web` process serves all sessions. No built-in horizontal scaling.
