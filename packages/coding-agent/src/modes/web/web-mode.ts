@@ -22,7 +22,8 @@ export interface ResolvedWebModeOptions {
 	port: number;
 	host: string;
 	authToken: string | undefined;
-	corsOrigin: string;
+	appManaged: boolean;
+	corsOrigin: string | null;
 	maxRuntimes: number;
 	idleTimeoutMs: number;
 	maxConcurrentTurns: number;
@@ -41,8 +42,12 @@ export function resolveWebModeOptions(
 	}
 	const rawToken = options.authToken ?? environment.PI_WEB_AUTH_TOKEN;
 	const authToken = rawToken && rawToken.length > 0 ? rawToken : undefined;
+	const appManaged = options.appManaged ?? isEnabled(environment.PI_WEB_APP_MANAGED);
 	const host = options.host ?? environment.PI_WEB_HOST ?? "127.0.0.1";
-	const corsOrigin = options.corsOrigin ?? environment.PI_WEB_CORS_ORIGIN ?? "*";
+	const corsOrigin = options.corsOrigin ?? environment.PI_WEB_CORS_ORIGIN ?? (appManaged ? null : "*");
+	if (appManaged && authToken === undefined) {
+		throw new Error("Authentication is required in app-managed web mode");
+	}
 	if (!isLoopbackHost(host) && authToken === undefined) {
 		throw new Error("Authentication is required for non-loopback web hosts");
 	}
@@ -79,6 +84,7 @@ export function resolveWebModeOptions(
 		port: rawPort,
 		host,
 		authToken,
+		appManaged,
 		corsOrigin,
 		maxRuntimes,
 		idleTimeoutMs,
@@ -89,8 +95,24 @@ export function resolveWebModeOptions(
 	};
 }
 
+function isEnabled(value: string | undefined): boolean {
+	return value === "1" || value?.toLowerCase() === "true";
+}
+
 function isLoopbackHost(host: string): boolean {
 	return host === "localhost" || host === "::1" || host === "[::1]" || /^127(?:\.\d{1,3}){3}$/.test(host);
+}
+
+export function createDefaultWebSessionManagerFactory(defaultSessionManager: SessionManager): WebSessionManagerFactory {
+	return (cwd, runtimeOptions) => {
+		if (runtimeOptions?.sessionPath) {
+			return SessionManager.open(runtimeOptions.sessionPath, runtimeOptions.sessionDir, cwd);
+		}
+		if (runtimeOptions?.sessionDir) return SessionManager.create(cwd, runtimeOptions.sessionDir);
+		return defaultSessionManager.isPersisted()
+			? SessionManager.create(cwd, defaultSessionManager.getSessionDir())
+			: SessionManager.inMemory(cwd);
+	};
 }
 
 export async function runWebMode(defaultRuntime: AgentSessionRuntime, options: RunWebModeOptions): Promise<never> {
@@ -98,25 +120,17 @@ export async function runWebMode(defaultRuntime: AgentSessionRuntime, options: R
 	const connectionManager = new ConnectionManager();
 	const defaultSessionManager = defaultRuntime.session.sessionManager;
 	const createSessionManager =
-		options.createSessionManager ??
-		((cwd: string, runtimeOptions?: { sessionDir?: string; sessionPath?: string }) => {
-			if (runtimeOptions?.sessionPath) {
-				return SessionManager.open(runtimeOptions.sessionPath, runtimeOptions.sessionDir, cwd);
-			}
-			if (runtimeOptions?.sessionDir) return SessionManager.create(cwd, runtimeOptions.sessionDir);
-			return defaultSessionManager.isPersisted()
-				? SessionManager.create(cwd, defaultSessionManager.getSessionDir())
-				: SessionManager.inMemory(cwd);
-		});
+		options.createSessionManager ?? createDefaultWebSessionManagerFactory(defaultSessionManager);
 	const sessionHost = new WebSessionHost({
 		defaultRuntime,
 		connectionManager,
 		createSessionManager,
-		createRuntime: (cwd, sessionManager) =>
+		createRuntime: (cwd, sessionManager, environment) =>
 			createAgentSessionRuntime(options.factory, {
 				cwd,
 				agentDir: options.agentDir,
 				sessionManager,
+				environment,
 			}),
 		maxRuntimes: config.maxRuntimes,
 		idleTimeoutMs: config.idleTimeoutMs,

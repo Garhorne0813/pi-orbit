@@ -40,6 +40,8 @@ export interface CreateAgentSessionOptions {
 	cwd?: string;
 	/** Global config directory. Default: ~/.pi/agent */
 	agentDir?: string;
+	/** Environment overrides inherited by runtime-managed child processes. */
+	environment?: NodeJS.ProcessEnv;
 
 	/** Canonical model/auth runtime. Defaults to a runtime using agentDir/auth.json and models.json. */
 	modelRuntime?: ModelRuntime;
@@ -381,6 +383,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		scopedModels: options.scopedModels,
 		resourceLoader,
 		customTools: options.customTools,
+		environment: options.environment,
 		modelRuntime,
 		initialActiveToolNames,
 		allowedToolNames,

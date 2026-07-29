@@ -33,6 +33,8 @@ export interface Args {
 	host?: string;
 	/** Web mode auth token (--auth-token) */
 	authToken?: string;
+	/** Require authentication for an application-managed Web mode process. */
+	webAppManaged?: boolean;
 	models?: string[];
 	tools?: string[];
 	excludeTools?: string[];
@@ -197,6 +199,8 @@ export function parseArgs(args: string[]): Args {
 			result.host = args[++i];
 		} else if (arg === "--auth-token" && i + 1 < args.length) {
 			result.authToken = args[++i];
+		} else if (arg === "--web-app-managed") {
+			result.webAppManaged = true;
 		} else if (arg === "--approve" || arg === "-a") {
 			result.projectTrustOverride = true;
 		} else if (arg === "--no-approve" || arg === "-na") {
@@ -298,6 +302,7 @@ ${chalk.bold("Options:")}
   --port <port>                  Web mode: HTTP server port (default: 3000)
   --host <host>                  Web mode: HTTP server host (default: 127.0.0.1)
   --auth-token <token>           Web mode: Bearer token for API auth (env: PI_WEB_AUTH_TOKEN)
+  --web-app-managed              Web mode: require auth and restrictive CORS defaults
   --help, -h                     Show this help
   --version, -v                  Show version number
 

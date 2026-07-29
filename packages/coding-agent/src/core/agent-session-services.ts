@@ -37,6 +37,7 @@ export interface AgentSessionRuntimeDiagnostic {
 export interface CreateAgentSessionServicesOptions {
 	cwd: string;
 	agentDir?: string;
+	environment?: NodeJS.ProcessEnv;
 	settingsManager?: SettingsManager;
 	modelRuntime?: ModelRuntime;
 	extensionFlagValues?: Map<string, boolean | string>;
@@ -72,6 +73,7 @@ export interface CreateAgentSessionFromServicesOptions {
 export interface AgentSessionServices {
 	cwd: string;
 	agentDir: string;
+	environment: NodeJS.ProcessEnv | undefined;
 	modelRuntime: ModelRuntime;
 	settingsManager: SettingsManager;
 	resourceLoader: ResourceLoader;
@@ -148,6 +150,7 @@ export async function createAgentSessionServices(
 		cwd,
 		agentDir,
 		settingsManager,
+		environment: options.environment,
 	});
 	await resourceLoader.reload(options.resourceLoaderReloadOptions);
 
@@ -183,6 +186,7 @@ export async function createAgentSessionServices(
 	return {
 		cwd,
 		agentDir,
+		environment: options.environment ? { ...options.environment } : undefined,
 		modelRuntime,
 		settingsManager,
 		resourceLoader,
@@ -214,6 +218,7 @@ export async function createAgentSessionFromServices(
 		excludeTools: options.excludeTools,
 		noTools: options.noTools,
 		customTools: options.customTools,
+		environment: options.services.environment,
 		sessionStartEvent: options.sessionStartEvent,
 	});
 }

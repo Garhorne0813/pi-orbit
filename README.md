@@ -91,7 +91,7 @@ Web mode turns Pi into a local agent service and runtime host. One process hosts
 export PI_WEB_AUTH_TOKEN='replace-with-a-long-random-token'
 export PI_WEB_CORS_ORIGIN='https://your-control-plane.example'
 
-./pi-test.sh --mode web --host 127.0.0.1 --port 3000
+./pi-test.sh --mode web --web-app-managed --host 127.0.0.1 --port 3000
 ```
 
 | Setting | Default | Description |
@@ -99,6 +99,7 @@ export PI_WEB_CORS_ORIGIN='https://your-control-plane.example'
 | `--host`, `PI_WEB_HOST` | `127.0.0.1` | HTTP bind address |
 | `--port`, `PI_WEB_PORT` | `3000` | HTTP port, from 1 to 65535 |
 | `--auth-token`, `PI_WEB_AUTH_TOKEN` | unset | Process-wide Bearer token |
+| `--web-app-managed`, `PI_WEB_APP_MANAGED` | disabled | Require authentication and disable CORS response headers by default |
 | `PI_WEB_CORS_ORIGIN` | `*` | Allowed browser origin |
 | `PI_WEB_MAX_RUNTIMES` | `64` | Maximum hosted runtimes, including the startup runtime |
 | `PI_WEB_MAX_CONCURRENT_TURNS` | `4` | Maximum simultaneous model turns across all runtimes |
@@ -107,7 +108,7 @@ export PI_WEB_CORS_ORIGIN='https://your-control-plane.example'
 | `PI_WEB_RUNTIME_DISPOSE_TIMEOUT_MS` | `10000` | Maximum wait for one runtime to dispose |
 | `PI_WEB_SHUTDOWN_TIMEOUT_MS` | `15000` | Maximum graceful host shutdown time |
 
-The health and capabilities endpoints are public. Loopback development can run without a token. Binding to a non-loopback host requires both a Bearer token and an explicit CORS origin; insecure startup is rejected.
+The health and capabilities endpoints are public. Loopback development can run without a token. App-managed mode requires a token even on loopback and omits CORS response headers unless `PI_WEB_CORS_ORIGIN` is explicit. Binding to a non-loopback host requires both a Bearer token and an explicit CORS origin; insecure startup is rejected.
 
 ### Create a session and stream events
 
@@ -148,7 +149,8 @@ RUNTIME=$(curl -fsS -X POST "$BASE_URL/api/runtimes" \
   -H "Content-Type: application/json" \
   -d '{
     "cwd":"/absolute/path/to/project",
-    "sessionDir":"/absolute/path/to/pi-sessions"
+    "sessionDir":"/absolute/path/to/pi-sessions",
+    "runtimeEnv":{"VIRTUAL_ENV":"/absolute/path/to/project/.venv"}
   }')
 
 RUNTIME_ID=$(printf '%s' "$RUNTIME" | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeId"])')
@@ -162,17 +164,26 @@ curl -N "$BASE_URL/api/runtimes/$RUNTIME_ID/events" -H "$AUTH_HEADER"
 | `GET` | `/api/runtimes` | List runtime descriptors |
 | `GET` | `/api/runtimes/:runtimeId` | Read both identities, paths, activity, model, and busy state |
 | `GET` | `/api/runtimes/:runtimeId/health` | Read runtime-specific health and protocol information |
+| `GET` | `/api/runtimes/:runtimeId/state` | Reconcile model, thinking, session, queue, and busy state |
+| `GET` | `/api/runtimes/:runtimeId/commands` | List extension, prompt-template, and skill commands |
 | `POST` | `/api/runtimes/:runtimeId/resume` | Resume an explicit `sessionPath`, optionally checking `piSessionId` |
 | `POST` | `/api/runtimes/:runtimeId/prompt` | Submit a prompt; responses include both identities |
+| `POST` | `/api/runtimes/:runtimeId/steer` | Queue steering input during an active turn |
+| `POST` | `/api/runtimes/:runtimeId/follow-up` | Queue follow-up input during an active turn |
 | `POST` | `/api/runtimes/:runtimeId/abort` | Abort the active turn |
 | `POST` | `/api/runtimes/:runtimeId/compact` | Compact the current context |
 | `POST` | `/api/runtimes/:runtimeId/fork` | Fork the current Pi session while retaining the runtime handle |
 | `POST` | `/api/runtimes/:runtimeId/model` | Select an exact provider and model |
+| `POST` | `/api/runtimes/:runtimeId/thinking` | Set the current model's thinking level |
 | `POST` | `/api/runtimes/:runtimeId/ui-response` | Resolve a pending extension UI request over HTTP |
 | `GET` | `/api/runtimes/:runtimeId/events` | Stream versioned runtime event envelopes over SSE |
 | `DELETE` | `/api/runtimes/:runtimeId` | Dispose a dynamic runtime without deleting its JSONL session |
 
-Creation accepts `model` in `provider/modelId` form and an optional `thinking` level. Pi Web is a single-user, shared-process runtime host: environment variables, Provider credentials, `agentDir`, skills, extensions, and MCP configuration are process-level resources shared by every runtime. Runtime-scoped `runtimeEnv`, `skills`, and `extensions` fields are rejected. Stateful or cwd-dependent MCP servers should still use separate connections per runtime.
+Creation accepts `model` in `provider/modelId` form and an optional `thinking` level. Runtime descriptors return the active model as `{ "provider": "...", "id": "..." }` plus `qualifiedModel`, so control planes never need to infer a provider from a model ID.
+
+Pi Web is a single-user, shared-process runtime host. Provider credentials, `agentDir`, global skills, extensions, and MCP configuration are application-level resources. `runtimeEnv` supplies per-runtime overrides for Pi-managed child processes, including built-in bash, direct bash, and extension `pi.exec`, without changing `process.env`; `null` removes a variable. Runtime-scoped `skills` and `extensions` fields are rejected. Third-party extensions and MCP adapters that spawn processes directly must merge the runtime environment themselves.
+
+Each persisted session path and `piSessionId` has one runtime owner. Conflicts return HTTP 409 with `session_in_use`. Prompt and exclusive lifecycle operations use separate leases: `steer`, `follow-up`, abort controls, and UI responses remain available during an active turn, while a second prompt, resume, compact, fork, restart, or delete returns `runtime_busy`. Different runtimes can still execute concurrently within the process-wide turn limit.
 
 ### Session API
 
@@ -231,7 +242,9 @@ Legacy session transports provide serialized `AgentSessionEvent` values:
 - SSE: `GET /api/sessions/:id/events`
 - WebSocket: `GET /ws?session_id=<id>`
 
-The runtime-host transport uses `GET /api/runtimes/:runtimeId/events`. It subscribes when the runtime is created, not when a client connects, and wraps each event with `protocolVersion`, `runtimeId`, `piSessionId`, monotonic `sequence`, and `timestamp`. Supply `Last-Event-ID` or `?after=<sequence>` to replay the in-memory ring buffer. HTTP 409 with `event_replay_gap` means the caller must reconcile from runtime state because the requested sequence has expired.
+The runtime-host transport uses `GET /api/runtimes/:runtimeId/events`. It subscribes when the runtime is created, not when a client connects, and wraps each event with `protocolVersion`, `runtimeId`, `piSessionId`, monotonic `sequence`, and `timestamp`. Replay-window validation, live registration, and replay snapshotting are atomic, and each SSE client serializes its writes. Supply `Last-Event-ID` or `?after=<sequence>` to replay the in-memory ring buffer. HTTP 409 with `event_replay_gap` means the requested sequence expired; `event_sequence_ahead` means it is newer than the host's current sequence. Both require state reconciliation by the control plane.
+
+For a Pi-Science-style personal desktop migration, one authenticated Pi Web process can host multiple workspace runtimes within one user or trust domain. Keep process supervision, durable event persistence, frontend SSE translation, artifact/review observation, and restart-time `piSessionId -> runtimeId` reconciliation in the control plane. Use separate processes when workspaces require different trust boundaries, credentials, or OS-level isolation. To preserve a source runtime when forking, open its `sessionPath` in a second runtime and fork that second runtime; `/api/runtimes/:runtimeId/fork` intentionally changes the session owned by its existing runtime handle.
 
 WebSocket clients may also submit a prompt command:
 

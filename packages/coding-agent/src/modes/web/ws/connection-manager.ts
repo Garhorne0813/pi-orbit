@@ -16,13 +16,22 @@ export interface WebSocketLike {
 
 /** Per-session WebSocket connection tracking */
 interface SessionConnections {
-	clients: Map<WebSocketLike, "raw" | "envelope">;
+	clients: Map<WebSocketLike, { eventFormat: "raw" | "envelope"; replaying: boolean; pendingMessages: string[] }>;
 	runtime: AgentSessionRuntime;
 	unsubscribe: (() => void) | undefined;
 	pendingUIRequests: Map<string, (response: WsExtensionUIResponse) => boolean>;
 	events: RuntimeEventEnvelope[];
 	sequence: number;
 }
+
+export type RegisterResult =
+	| { ok: true; oldestSequence: number; latestSequence: number }
+	| {
+			ok: false;
+			code: "event_replay_gap" | "event_sequence_ahead";
+			oldestSequence: number;
+			latestSequence: number;
+	  };
 
 export class ConnectionManager {
 	private _sessions = new Map<string, SessionConnections>();
@@ -67,6 +76,27 @@ export class ConnectionManager {
 		}
 	}
 
+	async replaceSession(
+		sessionId: string,
+		runtime: AgentSessionRuntime,
+		bindSession: () => Promise<void>,
+		onEvent?: () => void,
+	): Promise<void> {
+		const connections = this._sessions.get(sessionId);
+		if (!connections) throw new Error(`Session is not tracked: ${sessionId}`);
+		await bindSession();
+		const previousRuntime = connections.runtime;
+		previousRuntime.setRebindSession(undefined);
+		connections.unsubscribe?.();
+		this.cancelPendingUIRequests(connections);
+		connections.runtime = runtime;
+		runtime.setRebindSession(async () => {
+			await bindSession();
+			this.subscribeToCurrentSession(sessionId, connections, onEvent);
+		});
+		this.subscribeToCurrentSession(sessionId, connections, onEvent);
+	}
+
 	/**
 	 * Register an event client and optionally replay buffered envelopes.
 	 */
@@ -74,16 +104,31 @@ export class ConnectionManager {
 		sessionId: string,
 		ws: WebSocketLike,
 		options: { eventFormat?: "raw" | "envelope"; afterSequence?: number } = {},
-	): void {
+	): RegisterResult {
 		const conn = this._sessions.get(sessionId);
 		if (!conn) throw new Error(`Session is not tracked: ${sessionId}`);
 		const eventFormat = options.eventFormat ?? "raw";
-		conn.clients.set(ws, eventFormat);
-		if (eventFormat === "envelope" && options.afterSequence !== undefined) {
-			for (const event of conn.events) {
-				if (event.sequence > options.afterSequence) ws.send(JSON.stringify(event));
+		const oldestSequence = conn.events[0]?.sequence ?? conn.sequence;
+		const latestSequence = conn.sequence;
+		const afterSequence = options.afterSequence;
+		if (eventFormat === "envelope" && afterSequence !== undefined) {
+			if (oldestSequence > 0 && afterSequence < oldestSequence - 1) {
+				return { ok: false, code: "event_replay_gap", oldestSequence, latestSequence };
+			}
+			if (afterSequence > latestSequence) {
+				return { ok: false, code: "event_sequence_ahead", oldestSequence, latestSequence };
 			}
 		}
+		const replay =
+			eventFormat === "envelope" && afterSequence !== undefined
+				? conn.events.filter((event) => event.sequence > afterSequence)
+				: [];
+		const client = { eventFormat, replaying: replay.length > 0, pendingMessages: [] as string[] };
+		conn.clients.set(ws, client);
+		for (const event of replay) this.deliverMessage(conn, ws, JSON.stringify(event));
+		client.replaying = false;
+		for (const message of client.pendingMessages.splice(0)) this.deliverMessage(conn, ws, message);
+		return { ok: true, oldestSequence, latestSequence };
 	}
 
 	unregister(sessionId: string, ws: WebSocketLike): void {
@@ -149,6 +194,7 @@ export class ConnectionManager {
 		oldestSequence: number;
 		latestSequence: number;
 		gap: boolean;
+		ahead: boolean;
 	} {
 		const connections = this._sessions.get(sessionId);
 		const oldestSequence = connections?.events[0]?.sequence ?? connections?.sequence ?? 0;
@@ -158,6 +204,7 @@ export class ConnectionManager {
 			oldestSequence,
 			latestSequence,
 			gap: oldestSequence > 0 && afterSequence < oldestSequence - 1,
+			ahead: afterSequence > latestSequence,
 		};
 	}
 
@@ -220,17 +267,24 @@ export class ConnectionManager {
 		if (connections.events.length > this.eventBufferSize) connections.events.shift();
 		const rawMessage = JSON.stringify(event);
 		const envelopeMessage = JSON.stringify(envelope);
-		for (const [client, eventFormat] of connections.clients) {
+		for (const [client, state] of connections.clients) {
+			const message = state.eventFormat === "envelope" ? envelopeMessage : rawMessage;
+			if (state.replaying) state.pendingMessages.push(message);
+			else this.deliverMessage(connections, client, message);
+		}
+	}
+
+	private deliverMessage(connections: SessionConnections, client: WebSocketLike, message: string): void {
+		if (!connections.clients.has(client)) return;
+		try {
+			client.send(message);
+		} catch {
 			try {
-				client.send(eventFormat === "envelope" ? envelopeMessage : rawMessage);
+				client.close(1011, "Event delivery failed");
 			} catch {
-				try {
-					client.close(1011, "Event delivery failed");
-				} catch {
-					// Ignore close failures for already-broken connections.
-				}
-				connections.clients.delete(client);
+				// Ignore close failures for already-broken connections.
 			}
+			connections.clients.delete(client);
 		}
 	}
 }

@@ -1,8 +1,10 @@
 import * as crypto from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { isValidThinkingLevel } from "../../cli/args.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
+import type { ReplacedSessionContext } from "../../core/extensions/index.ts";
 import { SessionManager } from "../../core/session-manager.ts";
 import type {
 	CreateRuntimeRequest,
@@ -15,7 +17,11 @@ import type {
 import { createWebExtensionUIContext } from "./ui-context.ts";
 import type { ConnectionManager } from "./ws/connection-manager.ts";
 
-export type WebRuntimeFactory = (cwd: string, sessionManager: SessionManager) => Promise<AgentSessionRuntime>;
+export type WebRuntimeFactory = (
+	cwd: string,
+	sessionManager: SessionManager,
+	runtimeEnvironment?: NodeJS.ProcessEnv,
+) => Promise<AgentSessionRuntime>;
 export type WebSessionManagerFactory = (
 	cwd: string,
 	options?: { sessionDir?: string; sessionPath?: string },
@@ -40,6 +46,30 @@ export class RuntimeCapacityError extends Error {
 	}
 }
 
+export class RuntimeBusyError extends Error {
+	constructor() {
+		super("Runtime is busy");
+		this.name = "RuntimeBusyError";
+	}
+}
+
+export class SessionInUseError extends Error {
+	readonly runtimeId: string;
+	readonly piSessionId: string;
+
+	constructor(runtimeId: string, piSessionId: string) {
+		super("Pi session is already in use");
+		this.name = "SessionInUseError";
+		this.runtimeId = runtimeId;
+		this.piSessionId = piSessionId;
+	}
+}
+
+interface RuntimeSessionIdentity {
+	piSessionId: string;
+	sessionPath: string | null;
+}
+
 export class WebSessionHost {
 	readonly defaultRuntimeId = crypto.randomUUID();
 	private readonly entries = new Map<string, WebSessionEntry>();
@@ -54,6 +84,9 @@ export class WebSessionHost {
 	private readonly disposeTimeoutMs: number;
 	private readonly evictedRuntimeIds = new Set<string>();
 	private readonly activeTurnRuntimeIds = new Set<string>();
+	private readonly activeRuntimeOperations = new Map<string, "turn" | "exclusive">();
+	private readonly sessionPathOwners = new Map<string, string>();
+	private readonly piSessionOwners = new Map<string, string>();
 	private creatingRuntimes = 0;
 	private initialized = false;
 	private disposed = false;
@@ -121,6 +154,7 @@ export class WebSessionHost {
 			lastActivityAt: now,
 			system: true,
 		});
+		this.claimSessionOwnership(this.defaultRuntimeId, this.identityOf(this.defaultRuntime));
 		try {
 			await this.connectionManager.trackSession(this.defaultRuntimeId, this.defaultRuntime, () =>
 				this.bindWebExtensions(this.defaultRuntime, this.defaultRuntimeId),
@@ -129,6 +163,7 @@ export class WebSessionHost {
 			this.startEvictionTimer();
 		} catch (error) {
 			this.entries.delete(this.defaultRuntimeId);
+			this.releaseSessionOwnership(this.defaultRuntimeId, this.identityOf(this.defaultRuntime));
 			throw error;
 		}
 	}
@@ -141,6 +176,7 @@ export class WebSessionHost {
 		const entry = this.entries.get(runtimeId);
 		if (!entry) return undefined;
 		const session = entry.runtime.session;
+		const model = session.model;
 		return {
 			runtimeId,
 			piSessionId: session.sessionId,
@@ -148,8 +184,13 @@ export class WebSessionHost {
 			cwd: entry.runtime.cwd,
 			createdAt: entry.createdAt,
 			lastActivityAt: entry.lastActivityAt,
-			busy: session.isStreaming || session.isCompacting || session.pendingMessageCount > 0,
-			model: session.model?.id ?? null,
+			busy:
+				this.isRuntimeOperating(runtimeId) ||
+				session.isStreaming ||
+				session.isCompacting ||
+				session.pendingMessageCount > 0,
+			model: model ? { provider: model.provider, id: model.id } : null,
+			qualifiedModel: model ? `${model.provider}/${model.id}` : null,
 			thinking: session.thinkingLevel ?? null,
 			isStreaming: session.isStreaming,
 			isCompacting: session.isCompacting,
@@ -177,13 +218,21 @@ export class WebSessionHost {
 		if (this.disposed) throw new Error("Web session host is disposed");
 		await this.acquireRuntimeSlot();
 		let runtime: AgentSessionRuntime | undefined;
-		let runtimeId: string | undefined;
+		const runtimeId = crypto.randomUUID();
+		let claimedIdentity: RuntimeSessionIdentity | undefined;
 		try {
 			const sessionManager = this.createSessionManager(request.cwd, {
 				sessionDir: request.sessionDir,
 				sessionPath: request.sessionPath,
 			});
-			const createdRuntime = await this.createRuntime(request.cwd, sessionManager);
+			claimedIdentity = this.identityOfSessionManager(sessionManager);
+			this.claimSessionOwnership(runtimeId, claimedIdentity);
+			const runtimeEnvironment = request.runtimeEnv
+				? Object.fromEntries(
+						Object.entries(request.runtimeEnv).map(([key, value]) => [key, value === null ? undefined : value]),
+					)
+				: undefined;
+			const createdRuntime = await this.createRuntime(request.cwd, sessionManager, runtimeEnvironment);
 			runtime = createdRuntime;
 			if (request.model !== undefined) {
 				const separator = request.model.indexOf("/");
@@ -202,25 +251,22 @@ export class WebSessionHost {
 				if (!isValidThinkingLevel(request.thinking)) throw new Error(`Invalid thinking level: ${request.thinking}`);
 				createdRuntime.session.setThinkingLevel(request.thinking);
 			}
-			const createdRuntimeId = crypto.randomUUID();
-			runtimeId = createdRuntimeId;
 			const now = Date.now();
-			this.entries.set(createdRuntimeId, { runtime: createdRuntime, createdAt: now, lastActivityAt: now });
+			this.entries.set(runtimeId, { runtime: createdRuntime, createdAt: now, lastActivityAt: now });
 			await this.connectionManager.trackSession(
-				createdRuntimeId,
+				runtimeId,
 				createdRuntime,
-				() => this.bindWebExtensions(createdRuntime, createdRuntimeId),
-				() => this.markActivity(createdRuntimeId),
+				() => this.bindWebExtensions(createdRuntime, runtimeId),
+				() => this.markActivity(runtimeId),
 			);
-			const descriptor = this.describe(createdRuntimeId);
+			const descriptor = this.describe(runtimeId);
 			if (!descriptor) throw new Error("Runtime registration failed");
 			return descriptor;
 		} catch (error) {
-			if (runtimeId) {
-				this.entries.delete(runtimeId);
-				this.connectionManager.removeSession(runtimeId);
-			}
-			if (runtime) await this.disposeRuntime(runtimeId ?? "unregistered", runtime);
+			this.entries.delete(runtimeId);
+			this.connectionManager.removeSession(runtimeId);
+			if (claimedIdentity) this.releaseSessionOwnership(runtimeId, claimedIdentity);
+			if (runtime) await this.disposeRuntime(runtimeId, runtime);
 			throw error;
 		} finally {
 			this.creatingRuntimes--;
@@ -233,22 +279,179 @@ export class WebSessionHost {
 	): Promise<RuntimeDescriptor | undefined> {
 		const entry = this.entries.get(runtimeId);
 		if (!entry) return undefined;
-		if (request.piSessionId !== undefined) {
+		if (!this.tryAcquireRuntimeOperation(runtimeId)) throw new RuntimeBusyError();
+		const previousIdentity = this.identityOf(entry.runtime);
+		let targetIdentity: RuntimeSessionIdentity | undefined;
+		let switched = false;
+		try {
 			const target = SessionManager.open(request.sessionPath, undefined, request.cwdOverride);
-			if (target.getSessionId() !== request.piSessionId) {
+			if (request.piSessionId !== undefined && target.getSessionId() !== request.piSessionId) {
 				throw new Error(
 					`Pi session ID mismatch: expected ${request.piSessionId}, received ${target.getSessionId()}`,
 				);
 			}
+			targetIdentity = this.identityOfSessionManager(target);
+			this.claimSessionOwnership(runtimeId, targetIdentity);
+			const result = await entry.runtime.switchSession(request.sessionPath, { cwdOverride: request.cwdOverride });
+			if (!result.cancelled) {
+				switched = true;
+				this.replaceSessionOwnership(runtimeId, previousIdentity, this.identityOf(entry.runtime));
+			}
+		} finally {
+			if (!switched && targetIdentity) {
+				this.releaseSessionOwnershipDifference(runtimeId, targetIdentity, previousIdentity);
+			}
+			this.releaseRuntimeOperation(runtimeId);
 		}
-		await entry.runtime.switchSession(request.sessionPath, { cwdOverride: request.cwdOverride });
-		entry.lastActivityAt = Date.now();
 		return this.describe(runtimeId);
+	}
+
+	async switchSession(
+		runtimeId: string,
+		sessionPath: string,
+		options?: { cwdOverride?: string; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+	): Promise<{ cancelled: boolean } | undefined> {
+		return this.switchSessionWithLease(runtimeId, sessionPath, options, false);
+	}
+
+	private async switchSessionWithLease(
+		runtimeId: string,
+		sessionPath: string,
+		options: { cwdOverride?: string; withSession?: (ctx: ReplacedSessionContext) => Promise<void> } | undefined,
+		allowWithinTurn: boolean,
+	): Promise<{ cancelled: boolean } | undefined> {
+		const entry = this.entries.get(runtimeId);
+		if (!entry) return undefined;
+		const ownsLease = this.acquireLifecycleOperation(runtimeId, allowWithinTurn);
+		const previousIdentity = this.identityOf(entry.runtime);
+		let targetIdentity: RuntimeSessionIdentity | undefined;
+		let switched = false;
+		try {
+			const targetManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
+			targetIdentity = this.identityOfSessionManager(targetManager);
+			this.claimSessionOwnership(runtimeId, targetIdentity);
+			const result = await entry.runtime.switchSession(sessionPath, options);
+			if (!result.cancelled) {
+				switched = true;
+				this.replaceSessionOwnership(runtimeId, previousIdentity, this.identityOf(entry.runtime));
+			}
+			return result;
+		} finally {
+			if (!switched && targetIdentity) {
+				this.releaseSessionOwnershipDifference(runtimeId, targetIdentity, previousIdentity);
+			}
+			if (ownsLease) this.releaseRuntimeOperation(runtimeId);
+		}
+	}
+
+	async forkSession(
+		runtimeId: string,
+		entryId: string,
+		options?: Parameters<AgentSessionRuntime["fork"]>[1],
+	): Promise<{ cancelled: boolean; selectedText?: string } | undefined> {
+		return this.forkSessionWithLease(runtimeId, entryId, options, false);
+	}
+
+	private async forkSessionWithLease(
+		runtimeId: string,
+		entryId: string,
+		options: Parameters<AgentSessionRuntime["fork"]>[1],
+		allowWithinTurn: boolean,
+	): Promise<{ cancelled: boolean; selectedText?: string } | undefined> {
+		const entry = this.entries.get(runtimeId);
+		if (!entry) return undefined;
+		const ownsLease = this.acquireLifecycleOperation(runtimeId, allowWithinTurn);
+		const previousIdentity = this.identityOf(entry.runtime);
+		try {
+			const result = await entry.runtime.fork(entryId, options);
+			if (!result.cancelled) {
+				this.replaceSessionOwnership(runtimeId, previousIdentity, this.identityOf(entry.runtime));
+			}
+			return result;
+		} finally {
+			if (ownsLease) this.releaseRuntimeOperation(runtimeId);
+		}
+	}
+
+	async newSession(
+		runtimeId: string,
+		options?: Parameters<AgentSessionRuntime["newSession"]>[0],
+	): Promise<{ cancelled: boolean } | undefined> {
+		return this.newSessionWithLease(runtimeId, options, false);
+	}
+
+	private async newSessionWithLease(
+		runtimeId: string,
+		options: Parameters<AgentSessionRuntime["newSession"]>[0],
+		allowWithinTurn: boolean,
+	): Promise<{ cancelled: boolean } | undefined> {
+		const entry = this.entries.get(runtimeId);
+		if (!entry) return undefined;
+		const ownsLease = this.acquireLifecycleOperation(runtimeId, allowWithinTurn);
+		const previousIdentity = this.identityOf(entry.runtime);
+		try {
+			const result = await entry.runtime.newSession(options);
+			if (!result.cancelled) {
+				this.replaceSessionOwnership(runtimeId, previousIdentity, this.identityOf(entry.runtime));
+			}
+			return result;
+		} finally {
+			if (ownsLease) this.releaseRuntimeOperation(runtimeId);
+		}
+	}
+
+	async runExclusiveRuntimeAction<T>(
+		runtimeId: string,
+		action: (runtime: AgentSessionRuntime) => Promise<T>,
+	): Promise<T> {
+		return this.runRuntimeActionWithLease(runtimeId, action, false);
+	}
+
+	private async runRuntimeActionWithLease<T>(
+		runtimeId: string,
+		action: (runtime: AgentSessionRuntime) => Promise<T>,
+		allowWithinTurn: boolean,
+	): Promise<T> {
+		const entry = this.entries.get(runtimeId);
+		if (!entry) throw new RuntimeBusyError();
+		const ownsLease = this.acquireLifecycleOperation(runtimeId, allowWithinTurn);
+		try {
+			return await action(entry.runtime);
+		} finally {
+			if (ownsLease) this.releaseRuntimeOperation(runtimeId);
+		}
+	}
+
+	private acquireLifecycleOperation(runtimeId: string, allowWithinTurn: boolean): boolean {
+		if (allowWithinTurn && this.activeRuntimeOperations.get(runtimeId) === "turn") return false;
+		if (!this.tryAcquireRuntimeOperation(runtimeId)) throw new RuntimeBusyError();
+		return true;
 	}
 
 	markActivity(runtimeId: string): void {
 		const entry = this.entries.get(runtimeId);
 		if (entry) entry.lastActivityAt = Date.now();
+	}
+
+	tryAcquireRuntimeOperation(runtimeId: string, kind: "turn" | "exclusive" = "exclusive"): boolean {
+		if (!this.entries.has(runtimeId) || this.activeRuntimeOperations.has(runtimeId)) return false;
+		this.activeRuntimeOperations.set(runtimeId, kind);
+		this.markActivity(runtimeId);
+		return true;
+	}
+
+	canRunStreamControl(runtimeId: string): boolean {
+		const operation = this.activeRuntimeOperations.get(runtimeId);
+		return this.entries.has(runtimeId) && (operation === undefined || operation === "turn");
+	}
+
+	releaseRuntimeOperation(runtimeId: string): void {
+		this.activeRuntimeOperations.delete(runtimeId);
+		this.markActivity(runtimeId);
+	}
+
+	isRuntimeOperating(runtimeId: string): boolean {
+		return this.activeRuntimeOperations.has(runtimeId);
 	}
 
 	tryAcquireAgentTurn(runtimeId: string): boolean {
@@ -266,7 +469,8 @@ export class WebSessionHost {
 		if (this.disposed) throw new Error("Web session host is disposed");
 		await this.acquireRuntimeSlot();
 		let runtime: AgentSessionRuntime | undefined;
-		let sessionId: string | undefined;
+		const sessionId = crypto.randomUUID();
+		let claimedIdentity: RuntimeSessionIdentity | undefined;
 		try {
 			const cwd = request.cwd ?? process.cwd();
 			const sessionManager = this.createSessionManager(cwd);
@@ -275,26 +479,25 @@ export class WebSessionHost {
 				if (!name) throw new Error("Session name must be non-empty");
 				sessionManager.appendSessionInfo(name);
 			}
+			claimedIdentity = this.identityOfSessionManager(sessionManager);
+			this.claimSessionOwnership(sessionId, claimedIdentity);
 
 			const createdRuntime = await this.createRuntime(cwd, sessionManager);
 			runtime = createdRuntime;
-			const createdSessionId = crypto.randomUUID();
-			sessionId = createdSessionId;
 			const now = Date.now();
-			this.entries.set(createdSessionId, { runtime: createdRuntime, createdAt: now, lastActivityAt: now });
+			this.entries.set(sessionId, { runtime: createdRuntime, createdAt: now, lastActivityAt: now });
 			await this.connectionManager.trackSession(
-				createdSessionId,
+				sessionId,
 				createdRuntime,
-				() => this.bindWebExtensions(createdRuntime, createdSessionId),
-				() => this.markActivity(createdSessionId),
+				() => this.bindWebExtensions(createdRuntime, sessionId),
+				() => this.markActivity(sessionId),
 			);
-			return { sessionId: createdSessionId };
+			return { sessionId };
 		} catch (error) {
-			if (sessionId) {
-				this.entries.delete(sessionId);
-				this.connectionManager.removeSession(sessionId);
-			}
-			if (runtime) await this.disposeRuntime(sessionId ?? "unregistered", runtime);
+			this.entries.delete(sessionId);
+			this.connectionManager.removeSession(sessionId);
+			if (claimedIdentity) this.releaseSessionOwnership(sessionId, claimedIdentity);
+			if (runtime) await this.disposeRuntime(sessionId, runtime);
 			throw error;
 		} finally {
 			this.creatingRuntimes--;
@@ -312,7 +515,13 @@ export class WebSessionHost {
 			const session = entry.runtime.session;
 			if (!session.sessionManager.isPersisted() || !session.sessionFile || !existsSync(session.sessionFile))
 				continue;
-			if (session.isStreaming || session.isCompacting || session.pendingMessageCount > 0) continue;
+			if (
+				this.isRuntimeOperating(runtimeId) ||
+				session.isStreaming ||
+				session.isCompacting ||
+				session.pendingMessageCount > 0
+			)
+				continue;
 			this.connectionManager.publishRuntimeEvicted(runtimeId);
 			this.rememberEvictedRuntime(runtimeId);
 			await this.removeSession(runtimeId);
@@ -328,49 +537,59 @@ export class WebSessionHost {
 		if (oldest !== undefined) this.evictedRuntimeIds.delete(oldest);
 	}
 
-	async removeSession(sessionId: string): Promise<"removed" | "protected" | "not_found"> {
+	async removeSession(sessionId: string): Promise<"removed" | "protected" | "busy" | "not_found"> {
 		const entry = this.entries.get(sessionId);
 		if (!entry) return "not_found";
 		if (entry.system) return "protected";
+		if (!this.tryAcquireRuntimeOperation(sessionId)) return "busy";
 
 		this.entries.delete(sessionId);
+		this.releaseSessionOwnership(sessionId, this.identityOf(entry.runtime));
+		this.activeRuntimeOperations.delete(sessionId);
 		this.releaseAgentTurn(sessionId);
 		this.connectionManager.removeSession(sessionId);
 		await this.disposeRuntime(sessionId, entry.runtime);
 		return "removed";
 	}
 
-	async restartSession(sessionId: string): Promise<"restarted" | "not_found"> {
+	async restartSession(sessionId: string): Promise<"restarted" | "busy" | "not_found"> {
 		const entry = this.entries.get(sessionId);
 		if (!entry) return "not_found";
+		if (!this.tryAcquireRuntimeOperation(sessionId)) return "busy";
 
-		const sessionManager = this.createSessionManager(entry.runtime.cwd);
-		const name = entry.runtime.session.sessionName;
-		if (name) sessionManager.appendSessionInfo(name);
-		const replacement = await this.createRuntime(entry.runtime.cwd, sessionManager);
-
-		this.connectionManager.removeSession(sessionId);
 		try {
-			await this.connectionManager.trackSession(
-				sessionId,
-				replacement,
-				() => this.bindWebExtensions(replacement, sessionId),
-				() => this.markActivity(sessionId),
-			);
-		} catch (error) {
-			await this.disposeRuntime(sessionId, replacement);
-			await this.connectionManager.trackSession(
-				sessionId,
-				entry.runtime,
-				() => this.bindWebExtensions(entry.runtime, sessionId),
-				() => this.markActivity(sessionId),
-			);
-			throw error;
-		}
+			const sessionManager = this.createSessionManager(entry.runtime.cwd);
+			const name = entry.runtime.session.sessionName;
+			if (name) sessionManager.appendSessionInfo(name);
+			const replacementIdentity = this.identityOfSessionManager(sessionManager);
+			this.claimSessionOwnership(sessionId, replacementIdentity);
+			let replacement: AgentSessionRuntime | undefined;
+			try {
+				const createdReplacement = await this.createRuntime(
+					entry.runtime.cwd,
+					sessionManager,
+					entry.runtime.services.environment,
+				);
+				replacement = createdReplacement;
+				await this.connectionManager.replaceSession(
+					sessionId,
+					createdReplacement,
+					() => this.bindWebExtensions(createdReplacement, sessionId),
+					() => this.markActivity(sessionId),
+				);
 
-		this.entries.set(sessionId, { ...entry, runtime: replacement });
-		await this.disposeRuntime(sessionId, entry.runtime);
-		return "restarted";
+				this.entries.set(sessionId, { ...entry, runtime: createdReplacement });
+				this.replaceSessionOwnership(sessionId, this.identityOf(entry.runtime), replacementIdentity);
+				await this.disposeRuntime(sessionId, entry.runtime);
+				return "restarted";
+			} catch (error) {
+				this.releaseSessionOwnershipDifference(sessionId, replacementIdentity, this.identityOf(entry.runtime));
+				if (replacement) await this.disposeRuntime(sessionId, replacement);
+				throw error;
+			}
+		} finally {
+			this.releaseRuntimeOperation(sessionId);
+		}
 	}
 
 	async dispose(): Promise<void> {
@@ -379,7 +598,8 @@ export class WebSessionHost {
 		if (this.evictionTimer) clearInterval(this.evictionTimer);
 		const entries = [...this.entries];
 		this.entries.clear();
-		for (const [sessionId] of entries) {
+		for (const [sessionId, entry] of entries) {
+			this.releaseSessionOwnership(sessionId, this.identityOf(entry.runtime));
 			this.connectionManager.removeSession(sessionId);
 		}
 		await Promise.all(entries.map(([runtimeId, entry]) => this.disposeRuntime(runtimeId, entry.runtime)));
@@ -423,15 +643,100 @@ export class WebSessionHost {
 			mode: "web",
 			commandContextActions: {
 				waitForIdle: () => runtime.session.agent.waitForIdle(),
-				newSession: async (options) => runtime.newSession(options),
-				fork: async (entryId, options) => runtime.fork(entryId, options),
-				navigateTree: async (targetId, options) => runtime.session.navigateTree(targetId, options),
-				switchSession: async (sessionPath, options) => runtime.switchSession(sessionPath, options),
-				reload: async () => runtime.session.reload(),
+				newSession: async (options) =>
+					(await this.newSessionWithLease(sessionId, options, true)) ?? { cancelled: true },
+				fork: async (entryId, options) =>
+					(await this.forkSessionWithLease(sessionId, entryId, options, true)) ?? { cancelled: true },
+				navigateTree: (targetId, options) =>
+					this.runRuntimeActionWithLease(
+						sessionId,
+						(current) => current.session.navigateTree(targetId, options),
+						true,
+					),
+				switchSession: async (sessionPath, options) =>
+					(await this.switchSessionWithLease(sessionId, sessionPath, options, true)) ?? { cancelled: true },
+				reload: () => this.runRuntimeActionWithLease(sessionId, (current) => current.session.reload(), true),
 			},
 			onError: (error) => {
 				console.error(`[web] Session ${sessionId} extension error:`, error.error);
 			},
 		});
+	}
+
+	private identityOf(runtime: AgentSessionRuntime): RuntimeSessionIdentity {
+		return this.identityOfSessionManager(runtime.session.sessionManager);
+	}
+
+	private identityOfSessionManager(sessionManager: SessionManager): RuntimeSessionIdentity {
+		const sessionPath = sessionManager.getSessionFile();
+		return {
+			piSessionId: sessionManager.getSessionId(),
+			sessionPath: sessionPath ? this.canonicalSessionPath(sessionPath) : null,
+		};
+	}
+
+	private canonicalSessionPath(sessionPath: string): string {
+		const absolutePath = resolve(sessionPath);
+		try {
+			return realpathSync(absolutePath);
+		} catch {
+			try {
+				return join(realpathSync(dirname(absolutePath)), basename(absolutePath));
+			} catch {
+				return absolutePath;
+			}
+		}
+	}
+
+	private claimSessionOwnership(runtimeId: string, identity: RuntimeSessionIdentity): void {
+		const pathOwner = identity.sessionPath ? this.sessionPathOwners.get(identity.sessionPath) : undefined;
+		const idOwner = this.piSessionOwners.get(identity.piSessionId);
+		const conflictingOwner =
+			pathOwner !== undefined && pathOwner !== runtimeId
+				? pathOwner
+				: idOwner !== undefined && idOwner !== runtimeId
+					? idOwner
+					: undefined;
+		if (conflictingOwner) throw new SessionInUseError(conflictingOwner, identity.piSessionId);
+		if (identity.sessionPath) this.sessionPathOwners.set(identity.sessionPath, runtimeId);
+		this.piSessionOwners.set(identity.piSessionId, runtimeId);
+	}
+
+	private releaseSessionOwnership(runtimeId: string, identity: RuntimeSessionIdentity): void {
+		if (identity.sessionPath && this.sessionPathOwners.get(identity.sessionPath) === runtimeId) {
+			this.sessionPathOwners.delete(identity.sessionPath);
+		}
+		if (this.piSessionOwners.get(identity.piSessionId) === runtimeId) {
+			this.piSessionOwners.delete(identity.piSessionId);
+		}
+	}
+
+	private replaceSessionOwnership(
+		runtimeId: string,
+		previousIdentity: RuntimeSessionIdentity,
+		nextIdentity: RuntimeSessionIdentity,
+	): void {
+		this.claimSessionOwnership(runtimeId, nextIdentity);
+		this.releaseSessionOwnershipDifference(runtimeId, previousIdentity, nextIdentity);
+	}
+
+	private releaseSessionOwnershipDifference(
+		runtimeId: string,
+		identity: RuntimeSessionIdentity,
+		preservedIdentity: RuntimeSessionIdentity,
+	): void {
+		if (
+			identity.sessionPath &&
+			identity.sessionPath !== preservedIdentity.sessionPath &&
+			this.sessionPathOwners.get(identity.sessionPath) === runtimeId
+		) {
+			this.sessionPathOwners.delete(identity.sessionPath);
+		}
+		if (
+			identity.piSessionId !== preservedIdentity.piSessionId &&
+			this.piSessionOwners.get(identity.piSessionId) === runtimeId
+		) {
+			this.piSessionOwners.delete(identity.piSessionId);
+		}
 	}
 }

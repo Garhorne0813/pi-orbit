@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
@@ -17,7 +17,7 @@ import { SessionManager } from "../src/core/session-manager.ts";
 import { WebAccessPolicy } from "../src/modes/web/middleware/auth.ts";
 import { createApp, WebServerHost } from "../src/modes/web/server.ts";
 import { createWebExtensionUIContext } from "../src/modes/web/ui-context.ts";
-import { resolveWebModeOptions } from "../src/modes/web/web-mode.ts";
+import { createDefaultWebSessionManagerFactory, resolveWebModeOptions } from "../src/modes/web/web-mode.ts";
 import { WebSessionHost } from "../src/modes/web/web-session-host.ts";
 import { ConnectionManager, type WebSocketLike } from "../src/modes/web/ws/connection-manager.ts";
 
@@ -33,7 +33,7 @@ describe("web mode server", () => {
 			authToken?: string;
 			configureApiKey?: boolean;
 			promptRateLimit?: { limit: number; windowMs: number };
-			corsOrigin?: string;
+			corsOrigin?: string | null;
 			heartbeatIntervalMs?: number;
 			persistedSession?: boolean;
 			maxConcurrentTurns?: number;
@@ -74,11 +74,13 @@ describe("web mode server", () => {
 			cwd,
 			agentDir,
 			sessionManager,
+			environment,
 			sessionStartEvent,
 		}) => {
 			const services = await createAgentSessionServices({
 				cwd,
 				agentDir,
+				environment,
 				modelRuntime,
 				resourceLoaderOptions: {
 					noExtensions: true,
@@ -109,8 +111,8 @@ describe("web mode server", () => {
 		const sessionHost = new WebSessionHost({
 			defaultRuntime,
 			connectionManager,
-			createRuntime: (cwd, sessionManager) =>
-				createAgentSessionRuntime(factory, { cwd, agentDir: root, sessionManager }),
+			createRuntime: (cwd, sessionManager, environment) =>
+				createAgentSessionRuntime(factory, { cwd, agentDir: root, sessionManager, environment }),
 			createSessionManager: (cwd, runtimeOptions) =>
 				runtimeOptions?.sessionPath
 					? SessionManager.open(runtimeOptions.sessionPath, runtimeOptions.sessionDir, cwd)
@@ -186,7 +188,10 @@ describe("web mode server", () => {
 			features: {
 				runtimeApi: true,
 				eventReplay: true,
-				runtimeEnvironment: false,
+				atomicEventReplay: true,
+				runtimeOperationLeases: true,
+				qualifiedModelIdentity: true,
+				runtimeEnvironment: true,
 			},
 		});
 
@@ -264,6 +269,15 @@ describe("web mode server", () => {
 		});
 
 		const target = (await (await create()).json()) as { runtimeId: string; piSessionId: string };
+		const conflict = await fetch(`${baseUrl}/api/runtimes/${target.runtimeId}/resume`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ sessionPath: source.sessionPath, piSessionId: source.piSessionId }),
+		});
+		expect(conflict.status).toBe(409);
+		expect(await conflict.json()).toMatchObject({ code: "session_in_use" });
+		expect((await fetch(`${baseUrl}/api/runtimes/${source.runtimeId}`, { method: "DELETE" })).status).toBe(200);
+
 		const resumed = await fetch(`${baseUrl}/api/runtimes/${target.runtimeId}/resume`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
@@ -274,7 +288,102 @@ describe("web mode server", () => {
 			runtimeId: target.runtimeId,
 			piSessionId: source.piSessionId,
 			sessionPath: source.sessionPath,
+			busy: false,
 		});
+
+		const mismatch = await fetch(`${baseUrl}/api/runtimes/${target.runtimeId}/resume`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ sessionPath: source.sessionPath, piSessionId: "different-session" }),
+		});
+		expect(mismatch.status).toBe(409);
+		expect(await mismatch.json()).toMatchObject({ code: "pi_session_mismatch", retryable: false });
+	});
+
+	it("uses runtime sessionDir and sessionPath instead of the CLI startup session directory", async () => {
+		const root = join(tmpdir(), `pi-web-session-factory-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const startupDir = join(root, "startup");
+		const runtimeDir = join(root, "runtime");
+		mkdirSync(root, { recursive: true });
+		cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+		const startup = SessionManager.create(root, startupDir);
+		const createManager = createDefaultWebSessionManagerFactory(startup);
+		const created = createManager(root, { sessionDir: runtimeDir });
+		created.appendMessage({ role: "user", content: "persisted", timestamp: Date.now() });
+		created.appendMessage(fauxAssistantMessage("persisted response"));
+		const sessionPath = created.getSessionFile();
+		if (!sessionPath) throw new Error("missing persisted session path");
+
+		expect(sessionPath).toContain(runtimeDir);
+		const resumed = createManager(root, { sessionDir: runtimeDir, sessionPath });
+		expect(resumed.getSessionId()).toBe(created.getSessionId());
+		expect(resumed.getEntries()).toHaveLength(created.getEntries().length);
+		expect(sessionPath).not.toContain(startupDir);
+	});
+
+	it("rejects opening a persisted Pi session that is already owned by another runtime", async () => {
+		const { baseUrl, root } = await createHarness();
+		const sessionDir = join(root, "owned-sessions");
+		const sourceResponse = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ cwd: root, sessionDir }),
+		});
+		const source = (await sourceResponse.json()) as {
+			runtimeId: string;
+			piSessionId: string;
+			sessionPath: string;
+		};
+		await fetch(`${baseUrl}/api/runtimes/${source.runtimeId}/prompt`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ message: "persist ownership" }),
+		});
+
+		const conflict = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ cwd: root, sessionDir, sessionPath: source.sessionPath }),
+		});
+
+		expect(conflict.status).toBe(409);
+		expect(await conflict.json()).toMatchObject({
+			code: "session_in_use",
+			piSessionId: source.piSessionId,
+		});
+	});
+
+	it("detects session ownership through symlink and duplicate Pi session identities", async () => {
+		const { baseUrl, root } = await createHarness();
+		const sessionDir = join(root, "identity-sessions");
+		const manager = SessionManager.create(root, sessionDir);
+		manager.appendMessage({ role: "user", content: "owned", timestamp: Date.now() });
+		manager.appendMessage(fauxAssistantMessage("owned response"));
+		const sessionPath = manager.getSessionFile();
+		if (!sessionPath) throw new Error("missing persisted session path");
+		const ownerResponse = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ cwd: root, sessionDir, sessionPath }),
+		});
+		expect(ownerResponse.status).toBe(201);
+
+		const symlinkPath = join(root, "session-link.jsonl");
+		symlinkSync(sessionPath, symlinkPath);
+		const duplicatePath = join(root, "session-copy.jsonl");
+		copyFileSync(sessionPath, duplicatePath);
+		for (const candidate of [symlinkPath, duplicatePath]) {
+			const conflict = await fetch(`${baseUrl}/api/runtimes`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ cwd: root, sessionDir, sessionPath: candidate }),
+			});
+			expect(conflict.status, candidate).toBe(409);
+			expect(await conflict.json()).toMatchObject({
+				code: "session_in_use",
+				piSessionId: manager.getSessionId(),
+			});
+		}
 	});
 
 	it("applies explicit model and thinking settings while creating a runtime", async () => {
@@ -295,23 +404,92 @@ describe("web mode server", () => {
 		});
 
 		expect(response.status).toBe(201);
-		expect(await response.json()).toMatchObject({ model: model.id, thinking: "high" });
+		expect(await response.json()).toMatchObject({
+			model: { provider: model.provider, id: model.id },
+			qualifiedModel: `${model.provider}/${model.id}`,
+			thinking: "high",
+		});
 	});
 
-	it("uses process-level resources and rejects runtime-scoped environment or extension overrides", async () => {
+	it("updates thinking and reconciles state through runtime-host endpoints", async () => {
+		const { baseUrl, sessionHost } = await createHarness();
+		const runtimeId = sessionHost.defaultRuntimeId;
+		const updated = await fetch(`${baseUrl}/api/runtimes/${runtimeId}/thinking`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ level: "low" }),
+		});
+		expect(updated.status).toBe(200);
+		expect(await updated.json()).toMatchObject({
+			success: true,
+			runtimeId,
+			piSessionId: sessionHost.get(runtimeId)?.runtime.session.sessionId,
+			level: "low",
+		});
+
+		const state = await fetch(`${baseUrl}/api/runtimes/${runtimeId}/state`);
+		expect(state.status).toBe(200);
+		expect(await state.json()).toMatchObject({
+			runtimeId,
+			piSessionId: sessionHost.get(runtimeId)?.runtime.session.sessionId,
+			thinkingLevel: "low",
+			isStreaming: false,
+			isCompacting: false,
+			messageCount: 0,
+			pendingMessageCount: 0,
+		});
+	});
+
+	it("lists extension, prompt-template, and skill commands through the runtime API", async () => {
+		const { baseUrl, sessionHost } = await createHarness();
+		const response = await fetch(`${baseUrl}/api/runtimes/${sessionHost.defaultRuntimeId}/commands`);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ commands: [] });
+	});
+
+	it("applies runtime-scoped execution environments without changing process.env", async () => {
+		const { baseUrl, root } = await createHarness();
+		const key = `PI_WEB_RUNTIME_ENV_${Date.now()}`;
+		const original = process.env[key];
+		const createRuntime = async (value: string) => {
+			const response = await fetch(`${baseUrl}/api/runtimes`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					cwd: root,
+					sessionDir: join(root, `runtime-env-${value}`),
+					runtimeEnv: { [key]: value },
+				}),
+			});
+			expect(response.status).toBe(201);
+			return ((await response.json()) as { runtimeId: string }).runtimeId;
+		};
+		const firstRuntimeId = await createRuntime("first");
+		const secondRuntimeId = await createRuntime("second");
+		const readEnvironment = (runtimeId: string) =>
+			fetch(`${baseUrl}/api/sessions/${runtimeId}/bash`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ command: `printf %s "$${key}"` }),
+			});
+
+		const [first, second] = await Promise.all([readEnvironment(firstRuntimeId), readEnvironment(secondRuntimeId)]);
+		expect(await first.json()).toMatchObject({ output: "first", exitCode: 0 });
+		expect(await second.json()).toMatchObject({ output: "second", exitCode: 0 });
+		expect(process.env[key]).toBe(original);
+	});
+
+	it("uses process-level resources and rejects runtime-scoped extension overrides", async () => {
 		const { baseUrl, root } = await createHarness();
 		const capabilities = await fetch(`${baseUrl}/api/capabilities`);
 		expect(await capabilities.json()).toMatchObject({
 			isolationModel: "single-user-shared-process",
-			supportsRuntimeEnvironment: false,
+			supportsRuntimeEnvironment: true,
 			features: { runtimeResourceOverrides: false },
 		});
 
-		for (const override of [
-			{ runtimeEnv: { TEST_KEY: "value" } },
-			{ skills: ["/tmp/skill"] },
-			{ extensions: ["/tmp/extension.ts"] },
-		]) {
+		for (const override of [{ skills: ["/tmp/skill"] }, { extensions: ["/tmp/extension.ts"] }]) {
 			const response = await fetch(`${baseUrl}/api/runtimes`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
@@ -519,6 +697,21 @@ describe("web mode server", () => {
 		expect(received).toContain("websocket response");
 	});
 
+	it("rejects a runtime event cursor ahead of the current sequence", async () => {
+		const { baseUrl, sessionHost } = await createHarness();
+		const runtimeId = sessionHost.defaultRuntimeId;
+		const response = await fetch(`${baseUrl}/api/runtimes/${runtimeId}/events`, {
+			headers: { "Last-Event-ID": "1" },
+		});
+
+		expect(response.status).toBe(409);
+		expect(await response.json()).toMatchObject({
+			code: "event_sequence_ahead",
+			oldestSequence: 0,
+			latestSequence: 0,
+		});
+	});
+
 	it("returns 202 for REST prompts and protects the default session", async () => {
 		const { baseUrl, sessionHost } = await createHarness();
 		const prompt = await fetch(`${baseUrl}/api/sessions/${sessionHost.defaultSessionId}/prompt`, {
@@ -543,6 +736,19 @@ describe("web mode server", () => {
 		const followUp = vi.spyOn(session, "followUp").mockResolvedValue();
 		const abortBash = vi.spyOn(session, "abortBash");
 		const abortRetry = vi.spyOn(session, "abortRetry");
+		let finishTurn = () => {};
+		vi.spyOn(session, "prompt").mockImplementation((_message, promptOptions) => {
+			promptOptions?.preflightResult?.(true);
+			return new Promise<void>((resolve) => {
+				finishTurn = resolve;
+			});
+		});
+		const promptResponse = await fetch(`${baseUrl}/api/sessions/${sessionId}/prompt`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ message: "run" }),
+		});
+		expect(promptResponse.status).toBe(202);
 
 		const steerResponse = await fetch(`${baseUrl}/api/sessions/${sessionId}/steer`, {
 			method: "POST",
@@ -554,6 +760,16 @@ describe("web mode server", () => {
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ message: "then summarize" }),
 		});
+		const runtimeSteerResponse = await fetch(`${baseUrl}/api/runtimes/${sessionId}/steer`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ message: "runtime course" }),
+		});
+		const runtimeFollowUpResponse = await fetch(`${baseUrl}/api/runtimes/${sessionId}/follow-up`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ message: "runtime summary" }),
+		});
 		const abortBashResponse = await fetch(`${baseUrl}/api/sessions/${sessionId}/abort-bash`, {
 			method: "POST",
 		});
@@ -563,12 +779,51 @@ describe("web mode server", () => {
 
 		expect(steerResponse.status).toBe(200);
 		expect(followUpResponse.status).toBe(200);
+		expect(runtimeSteerResponse.status).toBe(200);
+		expect(runtimeFollowUpResponse.status).toBe(200);
 		expect(abortBashResponse.status).toBe(200);
 		expect(abortRetryResponse.status).toBe(200);
 		expect(steer).toHaveBeenCalledWith("change course", undefined);
 		expect(followUp).toHaveBeenCalledWith("then summarize", undefined);
+		expect(steer).toHaveBeenCalledWith("runtime course", undefined);
+		expect(followUp).toHaveBeenCalledWith("runtime summary", undefined);
 		expect(abortBash).toHaveBeenCalledOnce();
 		expect(abortRetry).toHaveBeenCalledOnce();
+		finishTurn();
+	});
+
+	it("rejects restart and legacy deletion while a prompt is active", async () => {
+		const { baseUrl, sessionHost, root } = await createHarness();
+		const created = await fetch(`${baseUrl}/api/sessions`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ cwd: root }),
+		});
+		const { sessionId } = (await created.json()) as { sessionId: string };
+		const session = sessionHost.get(sessionId)?.runtime.session;
+		if (!session) throw new Error("missing runtime session");
+		let finishTurn = () => {};
+		vi.spyOn(session, "prompt").mockImplementation((_message, promptOptions) => {
+			promptOptions?.preflightResult?.(true);
+			return new Promise<void>((resolve) => {
+				finishTurn = resolve;
+			});
+		});
+		await fetch(`${baseUrl}/api/sessions/${sessionId}/prompt`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ message: "run" }),
+		});
+
+		const restart = await fetch(`${baseUrl}/api/sessions/${sessionId}/restart`, { method: "POST" });
+		const deletion = await fetch(`${baseUrl}/api/sessions/${sessionId}`, { method: "DELETE" });
+
+		expect(restart.status).toBe(409);
+		expect(await restart.json()).toMatchObject({ code: "runtime_busy" });
+		expect(deletion.status).toBe(409);
+		expect(await deletion.json()).toMatchObject({ code: "runtime_busy" });
+		expect(sessionHost.get(sessionId)).toBeDefined();
+		finishTurn();
 	});
 
 	it("updates queue and automation settings and cycles model state", async () => {
@@ -644,15 +899,21 @@ describe("web mode server", () => {
 	});
 
 	it("restarts the protected default session without changing its web session id", async () => {
-		const { baseUrl, sessionHost } = await createHarness();
+		const { baseUrl, sessionHost, connectionManager } = await createHarness();
 		const sessionId = sessionHost.defaultSessionId;
 		const previousRuntime = sessionHost.get(sessionId)?.runtime;
 		if (!previousRuntime) throw new Error("missing default runtime");
+		await previousRuntime.session.prompt("before restart");
+		const previousSequence = connectionManager.getReplayWindow(sessionId, Number.MAX_SAFE_INTEGER).latestSequence;
 
 		const response = await fetch(`${baseUrl}/api/sessions/${sessionId}/restart`, { method: "POST" });
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({ success: true });
 		expect(sessionHost.get(sessionId)?.runtime).not.toBe(previousRuntime);
+		await sessionHost.get(sessionId)?.runtime.session.prompt("after restart");
+		const events = connectionManager.getBufferedEvents(sessionId, previousSequence);
+		expect(events.length).toBeGreaterThan(0);
+		expect(events[0]?.sequence).toBe(previousSequence + 1);
 	});
 
 	it("reports prompt preflight failures to REST clients", async () => {
@@ -717,6 +978,93 @@ describe("web mode server", () => {
 		finishTurn();
 		await vi.waitFor(() => expect(sessionHost.activeTurnCount).toBe(0));
 		expect((await prompt(secondRuntimeId)).status).toBe(202);
+	});
+
+	it("rejects a second prompt while the same runtime owns an operation lease", async () => {
+		const { baseUrl, sessionHost } = await createHarness({ maxConcurrentTurns: 2 });
+		const runtimeId = sessionHost.defaultRuntimeId;
+		const session = sessionHost.get(runtimeId)?.runtime.session;
+		if (!session) throw new Error("missing runtime session");
+		let finishTurn = () => {};
+		vi.spyOn(session, "prompt").mockImplementation((_message, options) => {
+			options?.preflightResult?.(true);
+			return new Promise<void>((resolve) => {
+				finishTurn = resolve;
+			});
+		});
+		const prompt = () =>
+			fetch(`${baseUrl}/api/runtimes/${runtimeId}/prompt`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ message: "run" }),
+			});
+
+		expect((await prompt()).status).toBe(202);
+		const descriptor = await fetch(`${baseUrl}/api/runtimes/${runtimeId}`);
+		expect(await descriptor.json()).toMatchObject({ busy: true });
+		const rejected = await prompt();
+		expect(rejected.status).toBe(409);
+		expect(await rejected.json()).toMatchObject({ code: "runtime_busy" });
+		finishTurn();
+	});
+
+	it("rejects resume while a runtime prompt is active", async () => {
+		const { baseUrl, sessionHost } = await createHarness();
+		const runtimeId = sessionHost.defaultRuntimeId;
+		const session = sessionHost.get(runtimeId)?.runtime.session;
+		if (!session) throw new Error("missing runtime session");
+		let finishTurn = () => {};
+		vi.spyOn(session, "prompt").mockImplementation((_message, options) => {
+			options?.preflightResult?.(true);
+			return new Promise<void>((resolve) => {
+				finishTurn = resolve;
+			});
+		});
+		await fetch(`${baseUrl}/api/runtimes/${runtimeId}/prompt`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ message: "run" }),
+		});
+
+		const resumed = await fetch(`${baseUrl}/api/runtimes/${runtimeId}/resume`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ sessionPath: "/tmp/busy.jsonl" }),
+		});
+		expect(resumed.status).toBe(409);
+		expect(await resumed.json()).toMatchObject({ code: "runtime_busy" });
+		finishTurn();
+	});
+
+	it("rejects deletion while a runtime prompt is active", async () => {
+		const { baseUrl, sessionHost, root } = await createHarness();
+		const created = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ cwd: root, sessionDir: join(root, "busy-delete-sessions") }),
+		});
+		const { runtimeId } = (await created.json()) as { runtimeId: string };
+		const session = sessionHost.get(runtimeId)?.runtime.session;
+		if (!session) throw new Error("missing runtime session");
+		let finishTurn = () => {};
+		vi.spyOn(session, "prompt").mockImplementation((_message, options) => {
+			options?.preflightResult?.(true);
+			return new Promise<void>((resolve) => {
+				finishTurn = resolve;
+			});
+		});
+		await fetch(`${baseUrl}/api/runtimes/${runtimeId}/prompt`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ message: "run" }),
+		});
+
+		const rejected = await fetch(`${baseUrl}/api/runtimes/${runtimeId}`, { method: "DELETE" });
+		expect(rejected.status).toBe(409);
+		expect(await rejected.json()).toMatchObject({ code: "runtime_busy" });
+		finishTurn();
+		await vi.waitFor(() => expect(sessionHost.isRuntimeOperating(runtimeId)).toBe(false));
+		expect((await fetch(`${baseUrl}/api/runtimes/${runtimeId}`, { method: "DELETE" })).status).toBe(200);
 	});
 
 	it("exposes session state, history, tree, statistics, and renaming APIs", async () => {
@@ -798,6 +1146,8 @@ describe("web mode server", () => {
 		const runtime = sessionHost.get(sessionId)?.runtime;
 		if (!runtime) throw new Error("missing default runtime");
 		await runtime.session.prompt("hello");
+		const originalSessionPath = runtime.session.sessionFile;
+		if (!originalSessionPath) throw new Error("missing original session path");
 
 		const outputPath = join(root, "session.html");
 		const exported = await fetch(`${baseUrl}/api/sessions/${sessionId}/export`, {
@@ -810,6 +1160,17 @@ describe("web mode server", () => {
 
 		const cloned = await fetch(`${baseUrl}/api/sessions/${sessionId}/clone`, { method: "POST" });
 		expect(await cloned.json()).toMatchObject({ success: true, cancelled: false });
+		expect(runtime.session.sessionFile).not.toBe(originalSessionPath);
+		const reopened = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				cwd: root,
+				sessionDir: join(root, "sessions"),
+				sessionPath: originalSessionPath,
+			}),
+		});
+		expect(reopened.status).toBe(201);
 	});
 
 	it("resolves environment authentication once and rejects invalid environment ports", () => {
@@ -839,6 +1200,29 @@ describe("web mode server", () => {
 		expect(
 			resolveWebModeOptions({ host: "0.0.0.0", authToken: "secret", corsOrigin: "https://control.example" }, {}),
 		).toMatchObject({ host: "0.0.0.0", authToken: "secret", corsOrigin: "https://control.example" });
+	});
+
+	it("requires authentication and restrictive default CORS in app-managed mode", () => {
+		expect(() => resolveWebModeOptions({ appManaged: true }, {})).toThrow(
+			"Authentication is required in app-managed web mode",
+		);
+		expect(resolveWebModeOptions({ appManaged: true, authToken: "secret" }, {})).toMatchObject({
+			appManaged: true,
+			authToken: "secret",
+			corsOrigin: null,
+		});
+		expect(resolveWebModeOptions({}, { PI_WEB_APP_MANAGED: "1", PI_WEB_AUTH_TOKEN: "from-env" })).toMatchObject({
+			appManaged: true,
+			authToken: "from-env",
+			corsOrigin: null,
+		});
+	});
+
+	it("omits CORS response headers when cross-origin access is disabled", async () => {
+		const { baseUrl } = await createHarness({ corsOrigin: null });
+		const response = await fetch(`${baseUrl}/api/health`, { headers: { Origin: "null" } });
+
+		expect(response.headers.get("Access-Control-Allow-Origin")).toBeNull();
 	});
 
 	it("uses the configured CORS origin", async () => {

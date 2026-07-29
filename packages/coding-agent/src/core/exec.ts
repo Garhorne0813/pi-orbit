@@ -15,6 +15,8 @@ export interface ExecOptions {
 	timeout?: number;
 	/** Working directory */
 	cwd?: string;
+	/** Environment passed to the child process. */
+	env?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -40,6 +42,7 @@ export async function execCommand(
 	return new Promise((resolve) => {
 		const proc = spawn(command, args, {
 			cwd,
+			env: options?.env,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
 		});

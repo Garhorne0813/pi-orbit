@@ -3,6 +3,7 @@ dist/
 .artifacts/
 *.log
 .DS_Store
+Thumbs.db
 *.tsbuildinfo
 # packages/*/node_modules/
 packages/*/dist/
@@ -14,6 +15,18 @@ packages/ai/src/providers/.model-generation-*/
 
 # Environment
 .env
+.env.*
+!.env.example
+!.env.*.example
+
+# Local Web mode runtime state
+/.pi-web/
+/.pi-science/
+
+# Local Web mode architecture reviews
+/packages/coding-agent/docs/web-mode-multi-workspace.md
+/packages/coding-agent/docs/web-mode-multi-workspace-review-followups.md
+/packages/coding-agent/docs/web-mode-multi-workspace-remediation.md
 
 # Editor files
 .vscode/
