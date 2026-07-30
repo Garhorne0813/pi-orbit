@@ -27,6 +27,7 @@ packages/ai/src/providers/.model-generation-*/
 /packages/coding-agent/docs/web-mode-multi-workspace.md
 /packages/coding-agent/docs/web-mode-multi-workspace-review-followups.md
 /packages/coding-agent/docs/web-mode-multi-workspace-remediation.md
+/packages/coding-agent/docs/web-mode-multi-workspace-remediation-review.md
 
 # Editor files
 .vscode/
