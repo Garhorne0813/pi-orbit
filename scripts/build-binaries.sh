@@ -97,18 +97,29 @@ fi
 if [[ "$SKIP_DEPS" == "false" ]]; then
     echo "==> Installing cross-platform native bindings..."
     CLIPBOARD_VERSION=$(node -p "require('./packages/coding-agent/package.json').optionalDependencies['@mariozechner/clipboard']")
-    # npm ci only installs optional deps for the current platform
-    # We need the base clipboard package and all platform bindings for bun cross-compilation
-    # Use --force to bypass platform checks (os/cpu restrictions in package.json)
-    # Install all in one command to avoid npm removing packages from previous installs
-    npm install --include=optional --no-save --package-lock=false --force --ignore-scripts \
-        @mariozechner/clipboard@"$CLIPBOARD_VERSION" \
-        @mariozechner/clipboard-darwin-arm64@"$CLIPBOARD_VERSION" \
-        @mariozechner/clipboard-darwin-x64@"$CLIPBOARD_VERSION" \
-        @mariozechner/clipboard-linux-x64-gnu@"$CLIPBOARD_VERSION" \
-        @mariozechner/clipboard-linux-arm64-gnu@"$CLIPBOARD_VERSION" \
-        @mariozechner/clipboard-win32-x64-msvc@"$CLIPBOARD_VERSION" \
-        @mariozechner/clipboard-win32-arm64-msvc@"$CLIPBOARD_VERSION"
+    # npm ci only installs optional deps for the current platform. Download the
+    # other platform packages without asking npm to recalculate the workspace
+    # dependency tree, which is both unnecessary and prone to Arborist errors.
+    NATIVE_PACKAGE_CACHE=$(mktemp -d)
+    trap 'rm -rf "$NATIVE_PACKAGE_CACHE"' EXIT
+    NATIVE_PACKAGES=(
+        clipboard-darwin-arm64
+        clipboard-darwin-x64
+        clipboard-linux-x64-gnu
+        clipboard-linux-arm64-gnu
+        clipboard-win32-x64-msvc
+        clipboard-win32-arm64-msvc
+    )
+    for package_name in "${NATIVE_PACKAGES[@]}"; do
+        archive_name=$(npm pack \
+            --silent \
+            --ignore-scripts \
+            --pack-destination "$NATIVE_PACKAGE_CACHE" \
+            "@mariozechner/$package_name@$CLIPBOARD_VERSION")
+        package_dir="node_modules/@mariozechner/$package_name"
+        mkdir -p "$package_dir"
+        tar -xzf "$NATIVE_PACKAGE_CACHE/$archive_name" -C "$package_dir" --strip-components=1
+    done
 else
     echo "==> Skipping cross-platform native bindings (--skip-deps)"
 fi
