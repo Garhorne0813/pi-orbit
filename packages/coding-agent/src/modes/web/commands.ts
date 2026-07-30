@@ -22,10 +22,10 @@ export type WebCommand =
 	| { type: "set_auto_retry"; enabled: boolean };
 
 export class WebCommandError extends Error {
-	readonly status: 400 | 404 | 429 | 500;
+	readonly status: 400 | 404 | 409 | 429 | 500;
 	readonly details: string | undefined;
 
-	constructor(message: string, status: 400 | 404 | 429 | 500, details?: string) {
+	constructor(message: string, status: 400 | 404 | 409 | 429 | 500, details?: string) {
 		super(message);
 		this.name = "WebCommandError";
 		this.status = status;
@@ -46,11 +46,26 @@ export class WebCommandHandler {
 		const entry = this.sessionHost.get(sessionId);
 		if (!entry) throw new WebCommandError("Session not found", 404);
 		const runtime = entry.runtime;
+		const unconditionalControl =
+			command.type === "abort" || command.type === "abort_bash" || command.type === "abort_retry";
+		const streamControl = command.type === "steer" || command.type === "follow_up";
+		const hostManagedLifecycle = command.type === "fork";
+		const ownsOperationLease = !unconditionalControl && !streamControl && !hostManagedLifecycle;
+		if (streamControl && !this.sessionHost.canRunStreamControl(sessionId)) {
+			throw new WebCommandError("Runtime is busy", 409);
+		}
+		if (
+			ownsOperationLease &&
+			!this.sessionHost.tryAcquireRuntimeOperation(sessionId, command.type === "prompt" ? "turn" : "exclusive")
+		) {
+			throw new WebCommandError("Runtime is busy", 409);
+		}
 
 		try {
 			switch (command.type) {
 				case "prompt":
 					if (!this.sessionHost.tryAcquireAgentTurn(sessionId)) {
+						this.sessionHost.releaseRuntimeOperation(sessionId);
 						throw new WebCommandError("Agent turn capacity exceeded", 429);
 					}
 					await new Promise<void>((resolve, reject) => {
@@ -71,7 +86,10 @@ export class WebCommandHandler {
 									reject(error);
 								}
 							})
-							.finally(() => this.sessionHost.releaseAgentTurn(sessionId));
+							.finally(() => {
+								this.sessionHost.releaseAgentTurn(sessionId);
+								this.sessionHost.releaseRuntimeOperation(sessionId);
+							});
 					});
 					return { success: true };
 				case "abort":
@@ -102,7 +120,8 @@ export class WebCommandHandler {
 						targetEntryId = firstUserEntry?.id;
 					}
 					if (!targetEntryId) throw new WebCommandError("No entry to fork from", 400);
-					const result = await runtime.fork(targetEntryId);
+					const result = await this.sessionHost.forkSession(sessionId, targetEntryId);
+					if (!result) throw new WebCommandError("Session not found", 404);
 					return result.cancelled
 						? { success: false, reason: "cancelled" }
 						: { success: true, selectedText: result.selectedText };
@@ -114,7 +133,11 @@ export class WebCommandHandler {
 					);
 					if (!model) throw new WebCommandError(`Model not found: ${command.provider}/${command.modelId}`, 404);
 					await runtime.session.setModel(model);
-					return { success: true, model: model.id };
+					return {
+						success: true,
+						model: { provider: model.provider, id: model.id },
+						qualifiedModel: `${model.provider}/${model.id}`,
+					};
 				}
 				case "set_thinking_level":
 					if (!isValidThinkingLevel(command.level)) {
@@ -143,10 +166,15 @@ export class WebCommandHandler {
 					runtime.session.setAutoRetryEnabled(command.enabled);
 					return { success: true, enabled: command.enabled };
 			}
+			throw new WebCommandError("Unsupported command", 400);
 		} catch (error) {
 			if (error instanceof WebCommandError) throw error;
 			const details = error instanceof Error ? error.message : String(error);
 			throw new WebCommandError(`Failed to execute ${command.type} command`, 500, details);
+		} finally {
+			if (ownsOperationLease && command.type !== "prompt") {
+				this.sessionHost.releaseRuntimeOperation(sessionId);
+			}
 		}
 	}
 }

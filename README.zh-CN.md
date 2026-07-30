@@ -91,7 +91,7 @@ Web mode 会把 Pi 转换为本地智能体服务和运行时宿主。一个进�
 export PI_WEB_AUTH_TOKEN='replace-with-a-long-random-token'
 export PI_WEB_CORS_ORIGIN='https://your-control-plane.example'
 
-./pi-test.sh --mode web --host 127.0.0.1 --port 3000
+./pi-test.sh --mode web --web-app-managed --host 127.0.0.1 --port 3000
 ```
 
 | 设置 | 默认值 | 说明 |
@@ -99,6 +99,7 @@ export PI_WEB_CORS_ORIGIN='https://your-control-plane.example'
 | `--host`、`PI_WEB_HOST` | `127.0.0.1` | HTTP 监听地址 |
 | `--port`、`PI_WEB_PORT` | `3000` | HTTP 端口，范围为 1–65535 |
 | `--auth-token`、`PI_WEB_AUTH_TOKEN` | 未设置 | 进程级 Bearer Token |
+| `--web-app-managed`、`PI_WEB_APP_MANAGED` | 关闭 | 强制认证，并默认不发送 CORS 许可响应头 |
 | `PI_WEB_CORS_ORIGIN` | `*` | 允许访问的浏览器来源 |
 | `PI_WEB_MAX_RUNTIMES` | `64` | 最大运行时数量，包含启动运行时 |
 | `PI_WEB_MAX_CONCURRENT_TURNS` | `4` | 所有运行时同时执行的最大模型轮次数 |
@@ -107,7 +108,7 @@ export PI_WEB_CORS_ORIGIN='https://your-control-plane.example'
 | `PI_WEB_RUNTIME_DISPOSE_TIMEOUT_MS` | `10000` | 单个运行时销毁的最长等待时间 |
 | `PI_WEB_SHUTDOWN_TIMEOUT_MS` | `15000` | 宿主优雅关闭的最长等待时间 |
 
-健康检查和能力端点无需认证。本地 loopback 开发可以不配置 Token；绑定到非 loopback 地址时必须同时配置 Bearer Token 和明确的 CORS Origin，否则服务拒绝启动。
+健康检查和能力端点无需认证。本地 loopback 开发可以不配置 Token；app-managed 模式即使监听 loopback 也必须配置 Token，并在未显式设置 `PI_WEB_CORS_ORIGIN` 时不发送 CORS 许可响应头。绑定到非 loopback 地址时必须同时配置 Bearer Token 和明确的 CORS Origin，否则服务拒绝启动。
 
 ### 创建会话并接收事件
 
@@ -148,7 +149,8 @@ RUNTIME=$(curl -fsS -X POST "$BASE_URL/api/runtimes" \
   -H "Content-Type: application/json" \
   -d '{
     "cwd":"/absolute/path/to/project",
-    "sessionDir":"/absolute/path/to/pi-sessions"
+    "sessionDir":"/absolute/path/to/pi-sessions",
+    "runtimeEnv":{"VIRTUAL_ENV":"/absolute/path/to/project/.venv"}
   }')
 
 RUNTIME_ID=$(printf '%s' "$RUNTIME" | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeId"])')
@@ -162,17 +164,26 @@ curl -N "$BASE_URL/api/runtimes/$RUNTIME_ID/events" -H "$AUTH_HEADER"
 | `GET` | `/api/runtimes` | 列出运行时描述符 |
 | `GET` | `/api/runtimes/:runtimeId` | 获取双 ID、路径、活动时间、模型和忙碌状态 |
 | `GET` | `/api/runtimes/:runtimeId/health` | 获取运行时健康状态和协议信息 |
+| `GET` | `/api/runtimes/:runtimeId/state` | 对账模型、思考级别、会话、队列和忙碌状态 |
+| `GET` | `/api/runtimes/:runtimeId/commands` | 列出 extension、prompt template 和 skill 命令 |
 | `POST` | `/api/runtimes/:runtimeId/resume` | 恢复显式 `sessionPath`，并可校验 `piSessionId` |
 | `POST` | `/api/runtimes/:runtimeId/prompt` | 提交提示，响应同时包含两个 ID |
+| `POST` | `/api/runtimes/:runtimeId/steer` | 在活动 turn 中加入 steering 输入 |
+| `POST` | `/api/runtimes/:runtimeId/follow-up` | 在活动 turn 中加入 follow-up 输入 |
 | `POST` | `/api/runtimes/:runtimeId/abort` | 中止当前轮次 |
 | `POST` | `/api/runtimes/:runtimeId/compact` | 压缩当前上下文 |
 | `POST` | `/api/runtimes/:runtimeId/fork` | 保留运行时句柄并派生新的 Pi 会话 |
 | `POST` | `/api/runtimes/:runtimeId/model` | 精确选择服务商和模型 |
+| `POST` | `/api/runtimes/:runtimeId/thinking` | 设置当前模型的思考级别 |
 | `POST` | `/api/runtimes/:runtimeId/ui-response` | 通过 HTTP 响应待处理的扩展 UI 请求 |
 | `GET` | `/api/runtimes/:runtimeId/events` | 通过 SSE 接收带版本的运行时事件 envelope |
 | `DELETE` | `/api/runtimes/:runtimeId` | 销毁动态运行时，但不删除 JSONL 会话 |
 
-创建请求支持 `provider/modelId` 格式的 `model` 和可选 `thinking`。Pi Web 定位为单用户共享进程运行时宿主：环境变量、Provider 凭据、`agentDir`、skills、extensions 和 MCP 配置均为所有运行时共享的进程级资源。服务会拒绝运行时专属的 `runtimeEnv`、`skills` 和 `extensions` 字段。对于保存状态或依赖 `cwd` 的 MCP Server，仍应为不同运行时建立独立连接。
+创建请求支持 `provider/modelId` 格式的 `model` 和可选 `thinking`。Runtime descriptor 会把当前模型返回为 `{ "provider": "...", "id": "..." }`，并提供 `qualifiedModel`，控制平面无需根据 model ID 猜测 Provider。
+
+Pi Web 定位为单用户共享进程运行时宿主。Provider 凭据、`agentDir`、全局 skills、extensions 和 MCP 配置属于应用级资源。`runtimeEnv` 为 Pi 管理的子进程提供 runtime 级覆盖，包括内建 bash、直接 bash 和 extension `pi.exec`，且不会修改 `process.env`；值为 `null` 时删除对应变量。服务仍会拒绝 runtime 级 `skills` 和 `extensions` 字段。直接创建子进程的第三方 extension 或 MCP adapter 必须自行合并 runtime 环境。
+
+每个持久化 session path 和 `piSessionId` 只能由一个 Runtime 持有，冲突返回 HTTP 409 和 `session_in_use`。Prompt 与排他生命周期操作使用不同租约：活动 turn 中仍可调用 `steer`、`follow-up`、abort 控制和 UI response；第二个 prompt、resume、compact、fork、restart 或 delete 返回 `runtime_busy`。不同 Runtime 仍可在进程级 turn 并发限制内并行执行。
 
 ### 会话 API
 
@@ -231,7 +242,9 @@ curl -N "$BASE_URL/api/runtimes/$RUNTIME_ID/events" -H "$AUTH_HEADER"
 - SSE：`GET /api/sessions/:id/events`
 - WebSocket：`GET /ws?session_id=<id>`
 
-运行时宿主使用 `GET /api/runtimes/:runtimeId/events`。事件订阅在运行时创建时建立，而不是在客户端连接时建立；每个事件都包含 `protocolVersion`、`runtimeId`、`piSessionId`、单调递增的 `sequence` 和 `timestamp`。客户端可以传入 `Last-Event-ID` 或 `?after=<sequence>` 重放内存环形缓冲。若返回 HTTP 409 和 `event_replay_gap`，说明请求序号已经过期，调用方必须从运行时状态重新对账。
+运行时宿主使用 `GET /api/runtimes/:runtimeId/events`。事件订阅在运行时创建时建立，而不是在客户端连接时建立；每个事件都包含 `protocolVersion`、`runtimeId`、`piSessionId`、单调递增的 `sequence` 和 `timestamp`。回放窗口校验、实时订阅注册和回放快照是原子操作，每个 SSE 客户端的写入也会串行执行。客户端可以传入 `Last-Event-ID` 或 `?after=<sequence>` 重放内存环形缓冲。HTTP 409 和 `event_replay_gap` 表示请求序号已过期，`event_sequence_ahead` 表示请求序号超前；两者都要求控制平面从运行时状态重新对账。
+
+面向 Pi Science 一类个人桌面控制平面迁移时，一个启用认证的 Pi Web 进程可以在同一用户或信任域内承载多个 workspace Runtime。进程监督、事件持久化、面向前端的 SSE 转换、artifact/review 观察以及进程重启后的 `piSessionId -> runtimeId` 对账仍由控制平面负责。只有 workspace 需要不同信任边界、凭据或 OS 级隔离时才拆分进程。若 fork 时必须保留源 Runtime，应先用源 `sessionPath` 创建第二个 Runtime，再在第二个 Runtime 上执行 fork；`/api/runtimes/:runtimeId/fork` 会有意切换现有 Runtime 所持有的 Pi session。
 
 WebSocket 客户端还可以发送提示命令：
 

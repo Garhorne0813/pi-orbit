@@ -14,7 +14,9 @@ export interface WebModeOptions {
 	host?: string;
 	/** Bearer token for API authentication (default: PI_WEB_AUTH_TOKEN env var) */
 	authToken?: string;
-	/** Allowed CORS origin (default: PI_WEB_CORS_ORIGIN env var or *) */
+	/** Require authentication and restrictive CORS defaults for app-managed processes. */
+	appManaged?: boolean;
+	/** Allowed CORS origin (default: PI_WEB_CORS_ORIGIN, disabled in app-managed mode, otherwise *). */
 	corsOrigin?: string;
 	/** Maximum runtimes held by one web host, including the startup runtime. */
 	maxRuntimes?: number;
@@ -48,7 +50,8 @@ export interface RuntimeDescriptor {
 	createdAt: number;
 	lastActivityAt: number;
 	busy: boolean;
-	model: string | null;
+	model: { provider: string; id: string } | null;
+	qualifiedModel: string | null;
 	thinking: string | null;
 	isStreaming: boolean;
 	isCompacting: boolean;
@@ -60,6 +63,7 @@ export interface CreateRuntimeRequest {
 	sessionPath?: string;
 	model?: string;
 	thinking?: string;
+	runtimeEnv?: Record<string, string | null>;
 }
 
 export interface ResumeRuntimeRequest {
@@ -72,15 +76,30 @@ export interface RuntimeCapabilities {
 	protocolVersion: 1;
 	piVersion: string;
 	isolationModel: "single-user-shared-process";
-	supportedCommands: readonly ["prompt", "abort", "compact", "fork", "model", "resume"];
-	supportsRuntimeEnvironment: false;
+	supportedCommands: readonly [
+		"prompt",
+		"steer",
+		"follow-up",
+		"abort",
+		"compact",
+		"fork",
+		"model",
+		"thinking",
+		"resume",
+	];
+	supportsRuntimeEnvironment: true;
 	supportsSessionResume: true;
 	supportsEventSequence: true;
 	supportsExtensionUI: true;
 	features: {
 		runtimeApi: true;
 		eventReplay: true;
-		runtimeEnvironment: false;
+		atomicEventReplay: true;
+		runtimeOperationLeases: true;
+		qualifiedModelIdentity: true;
+		runtimeState: true;
+		commandCatalog: true;
+		runtimeEnvironment: true;
 		runtimeResourceOverrides: false;
 		idleEviction: true;
 	};
@@ -89,15 +108,20 @@ export interface RuntimeCapabilities {
 export const RUNTIME_CAPABILITIES: Omit<RuntimeCapabilities, "piVersion"> = {
 	protocolVersion: 1,
 	isolationModel: "single-user-shared-process",
-	supportedCommands: ["prompt", "abort", "compact", "fork", "model", "resume"],
-	supportsRuntimeEnvironment: false,
+	supportedCommands: ["prompt", "steer", "follow-up", "abort", "compact", "fork", "model", "thinking", "resume"],
+	supportsRuntimeEnvironment: true,
 	supportsSessionResume: true,
 	supportsEventSequence: true,
 	supportsExtensionUI: true,
 	features: {
 		runtimeApi: true,
 		eventReplay: true,
-		runtimeEnvironment: false,
+		atomicEventReplay: true,
+		runtimeOperationLeases: true,
+		qualifiedModelIdentity: true,
+		runtimeState: true,
+		commandCatalog: true,
+		runtimeEnvironment: true,
 		runtimeResourceOverrides: false,
 		idleEviction: true,
 	},
@@ -284,7 +308,15 @@ export function isCreateRuntimeRequest(data: unknown): data is CreateRuntimeRequ
 	if (object.sessionPath !== undefined && !hasNonEmptyString(object, "sessionPath")) return false;
 	if (object.model !== undefined && !hasNonEmptyString(object, "model")) return false;
 	if (object.thinking !== undefined && !hasNonEmptyString(object, "thinking")) return false;
-	return object.runtimeEnv === undefined && object.skills === undefined && object.extensions === undefined;
+	if (object.runtimeEnv !== undefined && !isRuntimeEnvironment(object.runtimeEnv)) return false;
+	return object.skills === undefined && object.extensions === undefined;
+}
+
+function isRuntimeEnvironment(value: unknown): value is Record<string, string | null> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	return Object.entries(value).every(
+		([key, entry]) => key.length > 0 && !key.includes("\0") && (entry === null || typeof entry === "string"),
+	);
 }
 
 export function isResumeRuntimeRequest(data: unknown): data is ResumeRuntimeRequest {

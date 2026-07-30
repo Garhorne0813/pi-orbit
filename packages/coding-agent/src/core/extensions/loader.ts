@@ -232,6 +232,7 @@ function createExtensionAPI(
 	runtime: ExtensionRuntime,
 	cwd: string,
 	eventBus: EventBus,
+	environment?: NodeJS.ProcessEnv,
 ): ExtensionAPI {
 	const api = {
 		// Registration methods - write to extension
@@ -333,7 +334,10 @@ function createExtensionAPI(
 
 		exec(command: string, args: string[], options?: ExecOptions) {
 			runtime.assertActive();
-			return execCommand(command, args, options?.cwd ?? cwd, options);
+			return execCommand(command, args, options?.cwd ?? cwd, {
+				...options,
+				env: mergeEnvironment(environment, options?.env),
+			});
 		},
 
 		getActiveTools(): string[] {
@@ -457,6 +461,7 @@ async function loadExtension(
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
 	cacheToken?: ExtensionCacheToken,
+	environment?: NodeJS.ProcessEnv,
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
 
@@ -468,7 +473,7 @@ async function loadExtension(
 		}
 
 		const extension = createExtension(extensionPath, resolvedPath);
-		const api = createExtensionAPI(extension, runtime, cwd, eventBus);
+		const api = createExtensionAPI(extension, runtime, cwd, eventBus, environment);
 		await factory(api);
 		time(`${extensionPath} factory`, "extensions");
 
@@ -488,10 +493,11 @@ export async function loadExtensionFromFactory(
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
 	extensionPath = "<inline>",
+	environment?: NodeJS.ProcessEnv,
 ): Promise<Extension> {
 	const extension = createExtension(extensionPath, extensionPath);
 	const resolvedCwd = resolvePath(cwd);
-	const api = createExtensionAPI(extension, runtime, resolvedCwd, eventBus);
+	const api = createExtensionAPI(extension, runtime, resolvedCwd, eventBus, environment);
 	await factory(api);
 	time(`${extensionPath} factory`, "extensions");
 	return extension;
@@ -506,6 +512,7 @@ async function loadExtensionsInternal(
 	eventBus?: EventBus,
 	runtime?: ExtensionRuntime,
 	useCache = false,
+	environment?: NodeJS.ProcessEnv,
 ): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
@@ -521,6 +528,7 @@ async function loadExtensionsInternal(
 			resolvedEventBus,
 			resolvedRuntime,
 			cacheToken,
+			environment,
 		);
 
 		if (error) {
@@ -545,8 +553,9 @@ export async function loadExtensions(
 	cwd: string,
 	eventBus?: EventBus,
 	runtime?: ExtensionRuntime,
+	environment?: NodeJS.ProcessEnv,
 ): Promise<LoadExtensionsResult> {
-	return loadExtensionsInternal(paths, cwd, eventBus, runtime);
+	return loadExtensionsInternal(paths, cwd, eventBus, runtime, false, environment);
 }
 
 export async function loadExtensionsCached(
@@ -554,8 +563,24 @@ export async function loadExtensionsCached(
 	cwd: string,
 	eventBus?: EventBus,
 	runtime?: ExtensionRuntime,
+	environment?: NodeJS.ProcessEnv,
 ): Promise<LoadExtensionsResult> {
-	return loadExtensionsInternal(paths, cwd, eventBus, runtime, true);
+	return loadExtensionsInternal(paths, cwd, eventBus, runtime, true, environment);
+}
+
+function mergeEnvironment(
+	runtimeEnvironment: NodeJS.ProcessEnv | undefined,
+	commandEnvironment: NodeJS.ProcessEnv | undefined,
+): NodeJS.ProcessEnv | undefined {
+	if (!runtimeEnvironment && !commandEnvironment) return undefined;
+	const environment = { ...process.env };
+	for (const overrides of [runtimeEnvironment, commandEnvironment]) {
+		for (const [key, value] of Object.entries(overrides ?? {})) {
+			if (value === undefined) delete environment[key];
+			else environment[key] = value;
+		}
+	}
+	return environment;
 }
 
 interface PiManifest {

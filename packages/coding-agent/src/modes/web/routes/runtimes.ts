@@ -4,11 +4,13 @@ import {
 	isCreateRuntimeRequest,
 	isForkRequest,
 	isPromptRequest,
+	isQueuedMessageRequest,
 	isResumeRuntimeRequest,
 	isSetModelRequest,
+	isSetThinkingRequest,
 	isWsClientMessage,
 } from "../types.ts";
-import { RuntimeCapacityError, type WebSessionHost } from "../web-session-host.ts";
+import { RuntimeBusyError, RuntimeCapacityError, SessionInUseError, type WebSessionHost } from "../web-session-host.ts";
 import type { ConnectionManager } from "../ws/connection-manager.ts";
 
 export function registerRuntimeRoutes(
@@ -43,6 +45,17 @@ export function registerRuntimeRoutes(
 			if (error instanceof RuntimeCapacityError) {
 				return context.json({ error: error.message, code: "runtime_capacity_exceeded" } as const, 429);
 			}
+			if (error instanceof SessionInUseError) {
+				return context.json(
+					{
+						error: error.message,
+						code: "session_in_use",
+						piSessionId: error.piSessionId,
+						ownerRuntimeId: error.runtimeId,
+					} as const,
+					409,
+				);
+			}
 			const invalidConfiguration =
 				details.startsWith("Model must") ||
 				details.startsWith("Model not found") ||
@@ -65,6 +78,9 @@ export function registerRuntimeRoutes(
 		if (result === "protected") {
 			return context.json({ error: "Default runtime cannot be deleted" } as const, 403);
 		}
+		if (result === "busy") {
+			return context.json({ error: "Runtime is busy", code: "runtime_busy" } as const, 409);
+		}
 		return context.json({ success: true } as const);
 	});
 
@@ -73,6 +89,53 @@ export function registerRuntimeRoutes(
 		return descriptor
 			? context.json({ healthy: true, protocolVersion: 1 as const, ...descriptor })
 			: missingRuntimeResponse(context, sessionHost, context.req.param("runtimeId"));
+	});
+
+	app.get("/api/runtimes/:runtimeId/state", (context) => {
+		const runtimeId = context.req.param("runtimeId");
+		const descriptor = sessionHost.describe(runtimeId);
+		const entry = sessionHost.get(runtimeId);
+		if (!descriptor || !entry) return missingRuntimeResponse(context, sessionHost, runtimeId);
+		const session = entry.runtime.session;
+		return context.json({
+			...descriptor,
+			thinkingLevel: session.thinkingLevel,
+			steeringMode: session.steeringMode,
+			followUpMode: session.followUpMode,
+			sessionName: session.sessionName,
+			autoCompactionEnabled: session.autoCompactionEnabled,
+			messageCount: session.messages.length,
+			pendingMessageCount: session.pendingMessageCount,
+		});
+	});
+
+	app.get("/api/runtimes/:runtimeId/commands", (context) => {
+		const runtimeId = context.req.param("runtimeId");
+		const entry = sessionHost.get(runtimeId);
+		if (!entry) return missingRuntimeResponse(context, sessionHost, runtimeId);
+		const session = entry.runtime.session;
+		return context.json({
+			commands: [
+				...session.extensionRunner.getRegisteredCommands().map((command) => ({
+					name: command.invocationName,
+					description: command.description,
+					source: "extension" as const,
+					sourceInfo: command.sourceInfo,
+				})),
+				...session.promptTemplates.map((template) => ({
+					name: template.name,
+					description: template.description,
+					source: "prompt" as const,
+					sourceInfo: template.sourceInfo,
+				})),
+				...session.resourceLoader.getSkills().skills.map((skill) => ({
+					name: `skill:${skill.name}`,
+					description: skill.description,
+					source: "skill" as const,
+					sourceInfo: skill.sourceInfo,
+				})),
+			],
+		});
 	});
 
 	app.post("/api/runtimes/:runtimeId/resume", async (context) => {
@@ -85,14 +148,28 @@ export function registerRuntimeRoutes(
 				: missingRuntimeResponse(context, sessionHost, context.req.param("runtimeId"));
 		} catch (error) {
 			const details = error instanceof Error ? error.message : String(error);
+			if (error instanceof RuntimeBusyError) {
+				return context.json({ error: error.message, code: "runtime_busy" } as const, 409);
+			}
+			if (error instanceof SessionInUseError) {
+				return context.json(
+					{
+						error: error.message,
+						code: "session_in_use",
+						piSessionId: error.piSessionId,
+						ownerRuntimeId: error.runtimeId,
+					} as const,
+					409,
+				);
+			}
+			const sessionMismatch = details.startsWith("Pi session ID mismatch");
 			return context.json(
 				{
-					error: details.startsWith("Pi session ID mismatch")
-						? "Pi session ID mismatch"
-						: "Failed to resume runtime",
+					error: sessionMismatch ? "Pi session ID mismatch" : "Failed to resume runtime",
 					details,
+					...(sessionMismatch ? { code: "pi_session_mismatch" as const, retryable: false } : {}),
 				},
-				details.startsWith("Pi session ID mismatch") ? 409 : 500,
+				sessionMismatch ? 409 : 500,
 			);
 		}
 	});
@@ -106,6 +183,22 @@ export function registerRuntimeRoutes(
 	app.post("/api/runtimes/:runtimeId/abort", (context) =>
 		executeRuntimeCommand(context, sessionHost, commands, { type: "abort" }),
 	);
+	for (const [path, type] of [
+		["steer", "steer"],
+		["follow-up", "follow_up"],
+	] as const) {
+		app.post(`/api/runtimes/:runtimeId/${path}`, async (context) => {
+			const body = await readJson(context);
+			if (!isQueuedMessageRequest(body)) {
+				return context.json({ error: "Missing or invalid 'message' field" } as const, 400);
+			}
+			return executeRuntimeCommand(context, sessionHost, commands, {
+				type,
+				message: body.message,
+				images: body.images,
+			});
+		});
+	}
 	app.post("/api/runtimes/:runtimeId/compact", (context) =>
 		executeRuntimeCommand(context, sessionHost, commands, { type: "compact" }),
 	);
@@ -122,6 +215,12 @@ export function registerRuntimeRoutes(
 			return context.json({ error: "Missing 'provider' or 'modelId' field" } as const, 400);
 		}
 		return executeRuntimeCommand(context, sessionHost, commands, { type: "set_model", ...body });
+	});
+
+	app.post("/api/runtimes/:runtimeId/thinking", async (context) => {
+		const body = await readJson(context);
+		if (!isSetThinkingRequest(body)) return context.json({ error: "Missing 'level' field" } as const, 400);
+		return executeRuntimeCommand(context, sessionHost, commands, { type: "set_thinking_level", ...body });
 	});
 
 	app.post("/api/runtimes/:runtimeId/ui-response", async (context) => {
@@ -158,6 +257,9 @@ async function executeRuntimeCommand(
 	} catch (error) {
 		if (error instanceof WebCommandError) {
 			if (error.status === 404) return missingRuntimeResponse(context, sessionHost, runtimeId);
+			if (error.status === 409) {
+				return context.json({ error: error.message, code: "runtime_busy", runtimeId } as const, 409);
+			}
 			if (error.status === 429) {
 				return context.json({ error: error.message, code: "agent_turn_capacity_exceeded" } as const, 429);
 			}

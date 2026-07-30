@@ -30,6 +30,8 @@ describe("web session host", () => {
 			idleTimeoutMs?: number;
 			eventBufferSize?: number;
 			disposeTimeoutMs?: number;
+			failRuntimeCreationForCwd?: string;
+			failRuntimeCreationAfter?: number;
 		} = {},
 	) {
 		const { eventBufferSize, ...hostOptions } = options;
@@ -66,15 +68,25 @@ describe("web session host", () => {
 				},
 			],
 		});
+		let runtimeCreationCount = 0;
 		const factory: CreateAgentSessionRuntimeFactory = async ({
 			cwd,
 			agentDir,
 			sessionManager,
+			environment,
 			sessionStartEvent,
 		}) => {
+			runtimeCreationCount++;
+			if (
+				options.failRuntimeCreationForCwd === cwd ||
+				(options.failRuntimeCreationAfter !== undefined && runtimeCreationCount > options.failRuntimeCreationAfter)
+			) {
+				throw new Error("runtime factory failed");
+			}
 			const services = await createAgentSessionServices({
 				cwd,
 				agentDir,
+				environment,
 				modelRuntime,
 				resourceLoaderOptions: {
 					noExtensions: true,
@@ -107,8 +119,8 @@ describe("web session host", () => {
 			...hostOptions,
 			defaultRuntime,
 			connectionManager,
-			createRuntime: (cwd, sessionManager) =>
-				createAgentSessionRuntime(factory, { cwd, agentDir: root, sessionManager }),
+			createRuntime: (cwd, sessionManager, environment) =>
+				createAgentSessionRuntime(factory, { cwd, agentDir: root, sessionManager, environment }),
 			createSessionManager: (cwd, runtimeOptions) => {
 				const manager = runtimeOptions?.sessionPath
 					? SessionManager.open(runtimeOptions.sessionPath, runtimeOptions.sessionDir, cwd)
@@ -175,6 +187,46 @@ describe("web session host", () => {
 		expect(host.get(host.defaultSessionId)).toBeDefined();
 	});
 
+	it("keeps the current session usable when resume runtime creation fails", async () => {
+		const failureCwd = join(tmpdir(), `pi-web-failed-resume-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(failureCwd, { recursive: true });
+		const { host, connectionManager, defaultRuntime, root } = await createHarness({
+			failRuntimeCreationForCwd: failureCwd,
+		});
+		const target = SessionManager.create(failureCwd, join(root, "resume-targets"));
+		target.appendMessage({ role: "user", content: "target", timestamp: Date.now() });
+		target.appendMessage(fauxAssistantMessage("target response"));
+		const targetPath = target.getSessionFile();
+		if (!targetPath) throw new Error("missing target session path");
+		const originalSessionId = defaultRuntime.session.sessionId;
+
+		await expect(
+			host.resumeRuntime(host.defaultRuntimeId, {
+				sessionPath: targetPath,
+				piSessionId: target.getSessionId(),
+				cwdOverride: failureCwd,
+			}),
+		).rejects.toThrow("runtime factory failed");
+
+		expect(defaultRuntime.session.sessionId).toBe(originalSessionId);
+		const eventCount = connectionManager.getBufferedEvents(host.defaultRuntimeId).length;
+		await expect(defaultRuntime.session.prompt("still usable")).resolves.toBeUndefined();
+		expect(connectionManager.getBufferedEvents(host.defaultRuntimeId).length).toBeGreaterThan(eventCount);
+	});
+
+	it("keeps the current runtime and event binding when restart creation fails", async () => {
+		const { host, connectionManager, defaultRuntime } = await createHarness({ failRuntimeCreationAfter: 1 });
+		const runtimeId = host.defaultRuntimeId;
+		const eventCount = connectionManager.getBufferedEvents(runtimeId).length;
+
+		await expect(host.restartSession(runtimeId)).rejects.toThrow("runtime factory failed");
+
+		expect(host.get(runtimeId)?.runtime).toBe(defaultRuntime);
+		expect(host.describe(runtimeId)?.busy).toBe(false);
+		await expect(defaultRuntime.session.prompt("still connected")).resolves.toBeUndefined();
+		expect(connectionManager.getBufferedEvents(runtimeId).length).toBeGreaterThan(eventCount);
+	});
+
 	it("rebinds event streaming after the runtime replaces its AgentSession", async () => {
 		const { host, connectionManager, defaultRuntime } = await createHarness();
 		const sent: string[] = [];
@@ -215,6 +267,42 @@ describe("web session host", () => {
 		expect(window.events).toHaveLength(2);
 		expect(window.oldestSequence).toBeGreaterThan(1);
 		expect(window.latestSequence).toBeGreaterThanOrEqual(window.oldestSequence);
+	});
+
+	it("atomically replays buffered events before live events produced during registration", async () => {
+		const { host, connectionManager, defaultRuntime } = await createHarness({ eventBufferSize: 4 });
+		await defaultRuntime.session.prompt("seed replay");
+		const runtimeId = host.defaultRuntimeId;
+		const before = connectionManager.getReplayWindow(runtimeId, Number.MAX_SAFE_INTEGER);
+		const afterSequence = before.oldestSequence - 1;
+		const received: number[] = [];
+		let injected = false;
+		const client: WebSocketLike = {
+			send: (data) => {
+				received.push((JSON.parse(data) as { sequence: number }).sequence);
+				if (injected) return;
+				injected = true;
+				connectionManager.sendToSession(runtimeId, {
+					type: "extension_ui_request",
+					id: "live-1",
+					method: "notify",
+					message: "one",
+				});
+				connectionManager.sendToSession(runtimeId, {
+					type: "extension_ui_request",
+					id: "live-2",
+					method: "notify",
+					message: "two",
+				});
+			},
+			close: () => {},
+		};
+
+		connectionManager.register(runtimeId, client, { eventFormat: "envelope", afterSequence });
+		const latestSequence = connectionManager.getReplayWindow(runtimeId, Number.MAX_SAFE_INTEGER).latestSequence;
+		expect(received).toEqual(
+			Array.from({ length: latestSequence - afterSequence }, (_, index) => afterSequence + index + 1),
+		);
 	});
 
 	it("disposes dynamically created runtimes when removed", async () => {
@@ -292,5 +380,25 @@ describe("web session host", () => {
 
 		expect(await host.evictIdleRuntimes(3_000)).toEqual([]);
 		expect(host.get(created.runtimeId)).toBeDefined();
+	});
+
+	it("does not idle-evict a persisted runtime while it owns an operation lease", async () => {
+		const { host, root } = await createHarness({ idleTimeoutMs: 1_000 });
+		const created = await host.createHostedRuntime({
+			cwd: root,
+			sessionDir: join(root, "leased-sessions"),
+		});
+		const entry = host.get(created.runtimeId);
+		if (!entry) throw new Error("missing persisted runtime");
+		await entry.runtime.session.prompt("persist before lease");
+		entry.lastActivityAt = 1_000;
+		expect(host.tryAcquireRuntimeOperation(created.runtimeId)).toBe(true);
+		entry.lastActivityAt = 1_000;
+
+		expect(await host.evictIdleRuntimes(3_000)).toEqual([]);
+		expect(host.get(created.runtimeId)).toBeDefined();
+		host.releaseRuntimeOperation(created.runtimeId);
+		entry.lastActivityAt = 1_000;
+		expect(await host.evictIdleRuntimes(3_000)).toEqual([created.runtimeId]);
 	});
 });

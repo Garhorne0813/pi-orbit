@@ -48,6 +48,7 @@ import {
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { resolvePath } from "../utils/paths.ts";
+import { getShellEnv } from "../utils/shell.ts";
 import { sleep } from "../utils/sleep.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
@@ -193,11 +194,25 @@ function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<str
 		: undefined;
 }
 
+function mergeEnvironment(
+	base: NodeJS.ProcessEnv | undefined,
+	overrides: NodeJS.ProcessEnv | undefined,
+): NodeJS.ProcessEnv {
+	const environment = { ...(base ?? getShellEnv()) };
+	for (const [key, value] of Object.entries(overrides ?? {})) {
+		if (value === undefined) delete environment[key];
+		else environment[key] = value;
+	}
+	return environment;
+}
+
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
 	cwd: string;
+	/** Environment overrides inherited by runtime-managed child processes. */
+	environment?: NodeJS.ProcessEnv;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	/** Resource loader for extensions, skills, prompts, themes, context files, and system prompt */
@@ -345,6 +360,7 @@ export class AgentSession {
 	private _customTools: ToolDefinition[];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
+	private readonly _environment: NodeJS.ProcessEnv | undefined;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	private _allowedToolNames?: Set<string>;
@@ -380,6 +396,7 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		this._environment = config.environment ? { ...config.environment } : undefined;
 		this._modelRuntime = config.modelRuntime;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
@@ -2561,7 +2578,13 @@ export class AgentSession {
 				)
 			: createAllToolDefinitions(this._cwd, {
 					read: { autoResizeImages },
-					bash: { commandPrefix: shellCommandPrefix, shellPath },
+					bash: {
+						commandPrefix: shellCommandPrefix,
+						shellPath,
+						spawnHook: this._environment
+							? (context) => ({ ...context, env: mergeEnvironment(context.env, this._environment) })
+							: undefined,
+					},
 				});
 
 		this._baseToolDefinitions = new Map(
@@ -2785,6 +2808,7 @@ export class AgentSession {
 						this._emit({ type: "bash_execution_update", id: options?.id, delta });
 					},
 					signal: abortController.signal,
+					env: this._environment ? mergeEnvironment(undefined, this._environment) : undefined,
 				},
 			);
 

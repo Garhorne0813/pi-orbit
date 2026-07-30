@@ -7,7 +7,7 @@ import {
 	isRenameSessionRequest,
 	isSwitchSessionRequest,
 } from "../types.ts";
-import type { WebSessionHost } from "../web-session-host.ts";
+import { RuntimeBusyError, SessionInUseError, type WebSessionHost } from "../web-session-host.ts";
 
 export interface SessionRoutesDeps {
 	sessionHost: WebSessionHost;
@@ -55,7 +55,8 @@ export function registerSessionRoutes(app: Hono, deps: SessionRoutesDeps): void 
 	});
 
 	app.get("/api/sessions/:id/state", (context) => {
-		const entry = sessionHost.get(context.req.param("id"));
+		const sessionId = context.req.param("id");
+		const entry = sessionHost.get(sessionId);
 		if (!entry) return context.json({ error: "Session not found" } as const, 404);
 		const session = entry.runtime.session;
 		return context.json({
@@ -148,8 +149,8 @@ export function registerSessionRoutes(app: Hono, deps: SessionRoutesDeps): void 
 	});
 
 	app.post("/api/sessions/:id/switch", async (context) => {
-		const entry = sessionHost.get(context.req.param("id"));
-		if (!entry) return context.json({ error: "Session not found" } as const, 404);
+		const sessionId = context.req.param("id");
+		if (!sessionHost.get(sessionId)) return context.json({ error: "Session not found" } as const, 404);
 		let body: unknown;
 		try {
 			body = await context.req.json();
@@ -158,9 +159,24 @@ export function registerSessionRoutes(app: Hono, deps: SessionRoutesDeps): void 
 		}
 		if (!isSwitchSessionRequest(body)) return context.json({ error: "Invalid switch request" } as const, 400);
 		try {
-			const result = await entry.runtime.switchSession(body.sessionPath, { cwdOverride: body.cwdOverride });
+			const result = await sessionHost.switchSession(sessionId, body.sessionPath, { cwdOverride: body.cwdOverride });
+			if (!result) return context.json({ error: "Session not found" } as const, 404);
 			return context.json({ success: !result.cancelled, cancelled: result.cancelled });
 		} catch (error) {
+			if (error instanceof RuntimeBusyError) {
+				return context.json({ error: error.message, code: "runtime_busy" } as const, 409);
+			}
+			if (error instanceof SessionInUseError) {
+				return context.json(
+					{
+						error: error.message,
+						code: "session_in_use",
+						piSessionId: error.piSessionId,
+						ownerRuntimeId: error.runtimeId,
+					} as const,
+					409,
+				);
+			}
 			return context.json(
 				{
 					error: "Failed to switch session",
@@ -172,7 +188,8 @@ export function registerSessionRoutes(app: Hono, deps: SessionRoutesDeps): void 
 	});
 
 	app.patch("/api/sessions/:id", async (context) => {
-		const entry = sessionHost.get(context.req.param("id"));
+		const sessionId = context.req.param("id");
+		const entry = sessionHost.get(sessionId);
 		if (!entry) return context.json({ error: "Session not found" } as const, 404);
 		let body: unknown;
 		try {
@@ -188,14 +205,19 @@ export function registerSessionRoutes(app: Hono, deps: SessionRoutesDeps): void 
 	});
 
 	app.post("/api/sessions/:id/clone", async (context) => {
-		const entry = sessionHost.get(context.req.param("id"));
+		const sessionId = context.req.param("id");
+		const entry = sessionHost.get(sessionId);
 		if (!entry) return context.json({ error: "Session not found" } as const, 404);
 		const leafId = entry.runtime.session.sessionManager.getLeafId();
 		if (!leafId) return context.json({ error: "Cannot clone session: no current entry selected" } as const, 400);
 		try {
-			const result = await entry.runtime.fork(leafId, { position: "at" });
+			const result = await sessionHost.forkSession(sessionId, leafId, { position: "at" });
+			if (!result) return context.json({ error: "Session not found" } as const, 404);
 			return context.json({ success: !result.cancelled, cancelled: result.cancelled });
 		} catch (error) {
+			if (error instanceof RuntimeBusyError) {
+				return context.json({ error: error.message, code: "runtime_busy" } as const, 409);
+			}
 			return context.json(
 				{
 					error: "Failed to clone session",
@@ -233,6 +255,9 @@ export function registerSessionRoutes(app: Hono, deps: SessionRoutesDeps): void 
 		try {
 			const result = await sessionHost.restartSession(context.req.param("id"));
 			if (result === "not_found") return context.json({ error: "Session not found" } as const, 404);
+			if (result === "busy") {
+				return context.json({ error: "Runtime is busy", code: "runtime_busy" } as const, 409);
+			}
 			return context.json({ success: true } as const);
 		} catch (error) {
 			return context.json(
@@ -250,6 +275,9 @@ export function registerSessionRoutes(app: Hono, deps: SessionRoutesDeps): void 
 		if (result === "not_found") return context.json({ error: "Session not found" } as const, 404);
 		if (result === "protected") {
 			return context.json({ error: "Default session cannot be deleted" } as const, 403);
+		}
+		if (result === "busy") {
+			return context.json({ error: "Runtime is busy", code: "runtime_busy" } as const, 409);
 		}
 		return context.json({ success: true } as const);
 	});

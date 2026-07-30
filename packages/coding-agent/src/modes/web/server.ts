@@ -26,7 +26,8 @@ export interface CreateAppOptions {
 	accessPolicy: WebAccessPolicy;
 	commands?: WebCommandHandler;
 	promptRateLimit?: RateLimitOptions;
-	corsOrigin?: string;
+	/** `null` disables browser cross-origin response headers. */
+	corsOrigin?: string | null;
 	requestBodyLimitBytes?: number;
 }
 
@@ -35,14 +36,16 @@ export function createApp(options: CreateAppOptions): Hono {
 	const commands = options.commands ?? new WebCommandHandler(sessionHost);
 	const app = new Hono();
 
-	app.use(
-		"*",
-		cors({
-			origin: options.corsOrigin ?? "*",
-			allowHeaders: ["Content-Type", "Authorization"],
-			allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
-		}),
-	);
+	if (options.corsOrigin !== null) {
+		app.use(
+			"*",
+			cors({
+				origin: options.corsOrigin ?? "*",
+				allowHeaders: ["Content-Type", "Authorization"],
+				allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
+			}),
+		);
+	}
 	app.use(
 		"/api/*",
 		bodyLimit({

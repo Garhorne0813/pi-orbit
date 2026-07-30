@@ -55,19 +55,35 @@ export function registerEventRoutes(app: Hono, deps: EventRoutesDeps): void {
 		if (afterSequence !== undefined && (!Number.isSafeInteger(afterSequence) || afterSequence < 0)) {
 			return context.json({ error: "Invalid event sequence" } as const, 400);
 		}
-		if (afterSequence !== undefined) {
-			const replay = deps.connectionManager.getReplayWindow(runtimeId, afterSequence);
-			if (replay.gap) {
-				return context.json(
-					{
-						error: "Requested event sequence is no longer buffered",
-						code: "event_replay_gap",
-						oldestSequence: replay.oldestSequence,
-						latestSequence: replay.latestSequence,
-					} as const,
-					409,
-				);
-			}
+		const bufferedMessages: string[] = [];
+		let send = (data: string): void => {
+			bufferedMessages.push(data);
+		};
+		let closeRequested = false;
+		let close = () => {
+			closeRequested = true;
+		};
+		const client: WebSocketLike = {
+			send: (data) => send(data),
+			close: () => close(),
+		};
+		const registration = deps.connectionManager.register(runtimeId, client, {
+			eventFormat: "envelope",
+			afterSequence,
+		});
+		if (!registration.ok) {
+			return context.json(
+				{
+					error:
+						registration.code === "event_replay_gap"
+							? "Requested event sequence is no longer buffered"
+							: "Requested event sequence is ahead of the runtime",
+					code: registration.code,
+					oldestSequence: registration.oldestSequence,
+					latestSequence: registration.latestSequence,
+				} as const,
+				409,
+			);
 		}
 
 		return streamSSE(context, async (stream) => {
@@ -75,22 +91,25 @@ export function registerEventRoutes(app: Hono, deps: EventRoutesDeps): void {
 			const closed = new Promise<void>((resolve) => {
 				finish = resolve;
 			});
-			const client: WebSocketLike = {
-				send: (data) => {
-					const envelope = JSON.parse(data) as { sequence: number };
-					void stream
-						.writeSSE({ event: "runtime_event", id: String(envelope.sequence), data })
-						.catch(() => finish());
-				},
-				close: () => {
-					void stream.close();
-					finish();
-				},
+			let writeQueue = Promise.resolve();
+			const enqueue = (data: string) => {
+				const envelope = JSON.parse(data) as { sequence: number };
+				writeQueue = writeQueue
+					.then(() => stream.writeSSE({ event: "runtime_event", id: String(envelope.sequence), data }))
+					.catch(() => finish());
 			};
 			stream.onAbort(finish);
-			deps.connectionManager.register(runtimeId, client, { eventFormat: "envelope", afterSequence });
 			try {
 				await stream.writeSSE({ event: "connected", data: JSON.stringify(descriptor) });
+				send = enqueue;
+				for (const message of bufferedMessages.splice(0)) enqueue(message);
+				close = () => {
+					void writeQueue.finally(async () => {
+						await stream.close();
+						finish();
+					});
+				};
+				if (closeRequested) close();
 				await closed;
 			} finally {
 				deps.connectionManager.unregister(runtimeId, client);

@@ -671,6 +671,7 @@ export async function main(args: string[], options?: MainOptions) {
 		cwd,
 		agentDir,
 		sessionManager,
+		environment,
 		sessionStartEvent,
 		projectTrustContext,
 	}) => {
@@ -689,6 +690,7 @@ export async function main(args: string[], options?: MainOptions) {
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
+			environment,
 			settingsManager: runtimeSettingsManager,
 			extensionFlagValues: parsed.unknownFlags,
 			resourceLoaderReloadOptions: shouldResolveProjectTrust
@@ -877,12 +879,9 @@ export async function main(args: string[], options?: MainOptions) {
 			port: parsed.port,
 			host: parsed.host,
 			authToken: parsed.authToken,
+			appManaged: parsed.webAppManaged,
 			factory: createRuntime,
 			agentDir,
-			createSessionManager: (sessionCwd) =>
-				sessionManager.isPersisted()
-					? SessionManager.create(sessionCwd, sessionDir)
-					: SessionManager.inMemory(sessionCwd),
 		});
 	} else if (appMode === "interactive") {
 		const interactiveMode = new InteractiveMode(runtime, {
