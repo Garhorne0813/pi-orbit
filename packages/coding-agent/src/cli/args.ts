@@ -301,7 +301,7 @@ ${chalk.bold("Options:")}
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
   --port <port>                  Web mode: HTTP server port (default: 3000)
   --host <host>                  Web mode: HTTP server host (default: 127.0.0.1)
-  --auth-token <token>           Web mode: Bearer token for API auth (env: PI_WEB_AUTH_TOKEN)
+  --auth-token <token>           Web mode: Bearer token for API auth (env: PI_ORBIT_AUTH_TOKEN)
   --web-app-managed              Web mode: require auth and restrictive CORS defaults
   --help, -h                     Show this help
   --version, -v                  Show version number

@@ -16,7 +16,7 @@ export function createSessionRateLimit(options: RateLimitOptions): MiddlewareHan
 
 	return async (context, next) => {
 		const now = Date.now();
-		const key = context.req.param("id") ?? "";
+		const key = context.req.param("id") ?? context.req.param("runtimeId") ?? "";
 		const previous = buckets.get(key) ?? { tokens: options.limit, updatedAt: now };
 		const tokens = Math.min(options.limit, previous.tokens + (now - previous.updatedAt) * refillPerMillisecond);
 		if (tokens < 1) {

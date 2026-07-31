@@ -16,7 +16,13 @@ import { registerPromptRoutes } from "./routes/prompt.ts";
 import { registerRuntimeRoutes } from "./routes/runtimes.ts";
 import { registerSessionRoutes } from "./routes/sessions.ts";
 import { registerToolRoutes } from "./routes/tools.ts";
-import { type HealthResponse, isWsClientMessage, RUNTIME_CAPABILITIES } from "./types.ts";
+import {
+	type HealthResponse,
+	isSetProjectTrustRequest,
+	isWsClientMessage,
+	RUNTIME_CAPABILITIES,
+	type WebProjectTrustController,
+} from "./types.ts";
 import type { WebSessionHost } from "./web-session-host.ts";
 import type { ConnectionManager } from "./ws/connection-manager.ts";
 
@@ -29,6 +35,7 @@ export interface CreateAppOptions {
 	/** `null` disables browser cross-origin response headers. */
 	corsOrigin?: string | null;
 	requestBodyLimitBytes?: number;
+	projectTrustController?: WebProjectTrustController;
 }
 
 export function createApp(options: CreateAppOptions): Hono {
@@ -36,11 +43,11 @@ export function createApp(options: CreateAppOptions): Hono {
 	const commands = options.commands ?? new WebCommandHandler(sessionHost);
 	const app = new Hono();
 
-	if (options.corsOrigin !== null) {
+	if (options.corsOrigin !== undefined && options.corsOrigin !== null) {
 		app.use(
 			"*",
 			cors({
-				origin: options.corsOrigin ?? "*",
+				origin: options.corsOrigin,
 				allowHeaders: ["Content-Type", "Authorization"],
 				allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
 			}),
@@ -63,11 +70,48 @@ export function createApp(options: CreateAppOptions): Hono {
 		}),
 	);
 	app.get("/api/capabilities", (context) => context.json({ ...RUNTIME_CAPABILITIES, piVersion: VERSION }));
+	app.post("/api/auth/session", (context) => {
+		if (!accessPolicy.isRequestAuthorized(context.req.header("Authorization"))) {
+			return context.json({ error: "Unauthorized", details: "Invalid token" } as const, 401);
+		}
+		const cookie = accessPolicy.createSessionCookie();
+		if (cookie) context.header("Set-Cookie", cookie);
+		return context.body(null, 204);
+	});
 	app.use("/api/*", accessPolicy.createHttpMiddleware());
+	app.delete("/api/auth/session", (context) => {
+		context.header("Set-Cookie", accessPolicy.clearSessionCookie());
+		return context.body(null, 204);
+	});
+	app.get("/api/project-trust", (context) => {
+		if (!options.projectTrustController) {
+			return context.json(
+				{ error: "Project trust API is unavailable", code: "project_trust_unavailable" } as const,
+				501,
+			);
+		}
+		const cwd = context.req.query("cwd");
+		if (!cwd) return context.json({ error: "Missing cwd" } as const, 400);
+		return context.json(options.projectTrustController.getStatus(cwd));
+	});
+	app.put("/api/project-trust", async (context) => {
+		if (!options.projectTrustController) {
+			return context.json(
+				{ error: "Project trust API is unavailable", code: "project_trust_unavailable" } as const,
+				501,
+			);
+		}
+		let body: unknown;
+		try {
+			body = await context.req.json();
+		} catch {
+			return context.json({ error: "Invalid JSON body" } as const, 400);
+		}
+		if (!isSetProjectTrustRequest(body))
+			return context.json({ error: "Invalid project trust request" } as const, 400);
+		return context.json(options.projectTrustController.setDecision(body.cwd, body.decision));
+	});
 
-	registerSessionRoutes(app, { sessionHost });
-	registerRuntimeRoutes(app, sessionHost, commands, connectionManager);
-	registerEventRoutes(app, { sessionHost, connectionManager });
 	app.use(
 		"/api/sessions/:id/prompt",
 		createSessionRateLimit(options.promptRateLimit ?? { limit: 30, windowMs: 60_000 }),
@@ -76,6 +120,9 @@ export function createApp(options: CreateAppOptions): Hono {
 		"/api/runtimes/:runtimeId/prompt",
 		createSessionRateLimit(options.promptRateLimit ?? { limit: 30, windowMs: 60_000 }),
 	);
+	registerSessionRoutes(app, { sessionHost });
+	registerRuntimeRoutes(app, sessionHost, commands, connectionManager);
+	registerEventRoutes(app, { sessionHost, connectionManager });
 	registerPromptRoutes(app, { commands });
 	registerModelRoutes(app, { commands, sessionHost });
 	registerToolRoutes(app, { commands });

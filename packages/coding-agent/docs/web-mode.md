@@ -10,20 +10,20 @@ pi --mode web [--port 3000] [--host 127.0.0.1] [--auth-token <token>] [--web-app
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--port <port>` | `3000` or `PI_WEB_PORT` | HTTP server port (1–65535) |
-| `--host <host>` | `127.0.0.1` or `PI_WEB_HOST` | Bind address |
-| `--auth-token <token>` | `PI_WEB_AUTH_TOKEN` | Bearer token for API authentication |
-| `--web-app-managed` | `PI_WEB_APP_MANAGED` | Require authentication and restrictive CORS defaults for a desktop-managed process |
-| `PI_WEB_MAX_RUNTIMES` | `64` | Maximum hosted runtimes, including the startup runtime |
-| `PI_WEB_MAX_CONCURRENT_TURNS` | `4` | Maximum simultaneous model turns across all runtimes |
-| `PI_WEB_IDLE_TIMEOUT_MS` | `1800000` | Idle timeout for recoverable persisted runtimes |
-| `PI_WEB_REQUEST_BODY_LIMIT_BYTES` | `4194304` | Maximum HTTP API request body size |
-| `PI_WEB_RUNTIME_DISPOSE_TIMEOUT_MS` | `10000` | Maximum wait for one runtime to dispose |
-| `PI_WEB_SHUTDOWN_TIMEOUT_MS` | `15000` | Maximum graceful shutdown time |
+| `--port <port>` | `3000` or `PI_ORBIT_PORT` | HTTP server port (1–65535) |
+| `--host <host>` | `127.0.0.1` or `PI_ORBIT_HOST` | Bind address |
+| `--auth-token <token>` | `PI_ORBIT_AUTH_TOKEN` | Bearer token for API authentication |
+| `--web-app-managed` | `PI_ORBIT_APP_MANAGED` | Require authentication and restrictive CORS defaults for a desktop-managed process |
+| `PI_ORBIT_MAX_RUNTIMES` | `64` | Maximum hosted runtimes, including the startup runtime |
+| `PI_ORBIT_MAX_CONCURRENT_TURNS` | `4` | Maximum simultaneous model turns across all runtimes |
+| `PI_ORBIT_IDLE_TIMEOUT_MS` | `1800000` | Idle timeout for recoverable persisted runtimes |
+| `PI_ORBIT_REQUEST_BODY_LIMIT_BYTES` | `4194304` | Maximum HTTP API request body size |
+| `PI_ORBIT_RUNTIME_DISPOSE_TIMEOUT_MS` | `10000` | Maximum wait for one runtime to dispose |
+| `PI_ORBIT_SHUTDOWN_TIMEOUT_MS` | `15000` | Maximum graceful shutdown time |
 
-Loopback development can run without authentication. A non-loopback host requires both `--auth-token`/`PI_WEB_AUTH_TOKEN` and an explicit `PI_WEB_CORS_ORIGIN`; otherwise startup fails.
+Loopback development can run without authentication. CORS response headers are disabled by default on every host. A non-loopback host requires both `--auth-token`/`PI_ORBIT_AUTH_TOKEN` and an explicit `PI_ORBIT_CORS_ORIGIN`; otherwise startup fails.
 
-App-managed mode also requires an authentication token on loopback and omits CORS response headers by default. Set `PI_WEB_CORS_ORIGIN` to the exact trusted origin when browser access is required. The desktop host should generate a new high-entropy token for every Pi Web process, keep it in memory, and proxy authenticated requests instead of exposing the token to browser JavaScript.
+App-managed mode also requires an authentication token on loopback and omits CORS response headers by default. Set `PI_ORBIT_CORS_ORIGIN` to the exact trusted origin when browser access is required. The desktop host should generate a new high-entropy token for every Pi Orbit process, keep it in memory, and proxy authenticated requests instead of exposing the token to browser JavaScript.
 
 ## Architecture
 
@@ -87,6 +87,7 @@ Create a runtime:
   "cwd": "/workspace/project",
   "sessionDir": "/workspace/state/sessions",
   "sessionPath": "/workspace/state/sessions/existing.jsonl",
+  "cwdOverride": "/workspace/project",
   "model": "anthropic/claude-sonnet-5",
   "thinking": "high",
   "runtimeEnv": {
@@ -97,7 +98,9 @@ Create a runtime:
 }
 ```
 
-`sessionPath`, `model`, `thinking`, and `runtimeEnv` are optional. A string in `runtimeEnv` overrides the inherited child-process value; `null` removes it. The environment is stored on the runtime and is used by built-in bash tools, direct bash commands, and extension `pi.exec` calls without mutating `process.env`. Provider credentials, `agentDir`, skills, extensions, and MCP configuration remain application-level resources; requests containing runtime-scoped `skills` or `extensions` are invalid. An MCP or third-party extension that starts processes directly must explicitly consume the runtime execution environment contract; Pi Web cannot intercept arbitrary `child_process.spawn` calls.
+`sessionDir`, `sessionPath`, `cwdOverride`, `model`, `thinking`, and `runtimeEnv` are optional. Omitting `sessionDir` inherits the startup runtime's persistence policy and session directory. `cwdOverride` is only for explicitly relocating an existing session and must resolve to the same canonical path as `cwd`.
+
+The canonical workspace is immutable for the lifetime of a runtime. Create, resume, and legacy switch operations reject a session recorded for another workspace with `runtime_workspace_mismatch`. A string in `runtimeEnv` overrides the inherited child-process value; `null` removes it. The environment is stored on the runtime and is used by built-in bash tools, direct bash commands, and extension `pi.exec` calls without mutating `process.env`. Provider credentials, `agentDir`, skills, extensions, and MCP configuration remain application-level resources; requests containing runtime-scoped `skills` or `extensions` are invalid. An MCP or third-party extension that starts processes directly must explicitly consume the runtime execution environment contract; Pi Orbit cannot intercept arbitrary `child_process.spawn` calls.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -127,7 +130,10 @@ A runtime descriptor contains:
   "runtimeId": "process-local-uuid",
   "piSessionId": "persisted-session-id",
   "sessionPath": "/workspace/state/sessions/session.jsonl",
+  "sessionDir": "/workspace/state/sessions",
   "cwd": "/workspace/project",
+  "workspaceCwd": "/workspace/project",
+  "persisted": true,
   "createdAt": 1770000000000,
   "lastActivityAt": 1770000000000,
   "busy": false,
@@ -135,9 +141,12 @@ A runtime descriptor contains:
   "qualifiedModel": "anthropic/claude-sonnet-5",
   "thinking": "high",
   "isStreaming": false,
-  "isCompacting": false
+  "isCompacting": false,
+  "diagnostics": []
 }
 ```
+
+Before creating a runtime, a control plane can read `GET /api/project-trust?cwd=<path>`. If `required` is true and `decision` is null, runtime creation returns HTTP 409 with `project_trust_required`. Persist a decision with `PUT /api/project-trust` and `{ "cwd": "...", "decision": true }`; use `false` to load the workspace without trust-requiring resources and `null` to clear the saved decision. Resource-loader errors return HTTP 422 with `runtime_initialization_failed` and structured diagnostics.
 
 ### Session Management
 
@@ -196,14 +205,18 @@ A runtime descriptor contains:
 |--------|------|-------------|
 | `GET` | `/api/health` | Health check with version, runtime counts, busy/active turns, capacity, and buffered-event usage. No auth required. |
 | `GET` | `/api/capabilities` | Protocol version, Pi version, supported runtime commands, and isolation capabilities. No auth required. |
+| `POST` | `/api/auth/session` | Exchange a valid Bearer header for an HttpOnly, same-origin authentication cookie. |
+| `DELETE` | `/api/auth/session` | Clear the browser authentication cookie. |
+| `GET` | `/api/project-trust?cwd=<path>` | Read the trust requirement and current decision for a workspace. |
+| `PUT` | `/api/project-trust` | Set or clear a workspace trust decision. |
 
 ### Responses
 
 All endpoints return JSON. Success responses use HTTP 2xx with a `success` field or the requested data. Errors use 4xx/5xx with `{ "error": "...", "details": "..." }`.
 
-Runtime endpoints also return stable error codes. `runtime_not_found` means the handle was never known, `runtime_evicted` means idle eviction removed it, `runtime_busy` means another mutation owns the runtime operation lease, `session_in_use` means another runtime owns the canonical path or `piSessionId`, `runtime_capacity_exceeded` means the host reached its configured limit, `pi_session_mismatch` means resume opened a different persisted identity, `event_replay_gap` means the requested sequence left the ring buffer, and `event_sequence_ahead` means the cursor is newer than the runtime's latest sequence.
+Runtime endpoints also return stable error codes. `runtime_not_found` means the handle was never known, `runtime_evicted` means idle eviction removed it, `runtime_busy` means another mutation owns the runtime operation lease, `session_in_use` means another runtime owns the canonical path or `piSessionId`, `runtime_capacity_exceeded` means the host reached its configured limit, `runtime_workspace_mismatch` means a persisted session belongs to another canonical workspace, `project_trust_required` means the caller must make a trust decision, `runtime_initialization_failed` includes resource-loader diagnostics, `pi_session_mismatch` means resume opened a different persisted identity, `event_replay_gap` means the requested sequence left the ring buffer, and `event_sequence_ahead` means the cursor is newer than the runtime's latest sequence.
 
-Prompt endpoints also enforce a host-wide active-turn limit. When the limit is reached, new prompts return HTTP 429 with `agent_turn_capacity_exceeded`; capacity is released when the running prompt finishes or fails. HTTP API bodies larger than `PI_WEB_REQUEST_BODY_LIMIT_BYTES` return HTTP 413 with `request_body_too_large`.
+Prompt endpoints also enforce a host-wide active-turn limit. When the limit is reached, new prompts return HTTP 429 with `agent_turn_capacity_exceeded`; capacity is released when the running prompt finishes or fails. HTTP API bodies larger than `PI_ORBIT_REQUEST_BODY_LIMIT_BYTES` return HTTP 413 with `request_body_too_large`.
 
 ## Runtime Event Protocol
 
@@ -231,8 +244,8 @@ ws://host:port/ws?session_id=<uuid>
 ```
 
 - `session_id` (required): The session to subscribe to.
-- When authentication is enabled, send `Authorization: Bearer <token>` on the HTTP upgrade request. Query-string tokens are rejected.
-- Native browser `WebSocket` cannot set this header. Put Pi behind an authenticated same-origin backend or reverse proxy that injects it; never expose the process token to browser JavaScript.
+- When authentication is enabled, send `Authorization: Bearer <token>` on the HTTP upgrade request or first exchange that header through `POST /api/auth/session`. Query-string tokens are rejected.
+- `POST /api/auth/session` sets an HttpOnly `pi_web_auth` cookie with `SameSite=Strict`. A desktop shell or backend can perform the exchange, after which native browser `WebSocket`, `EventSource`, and fetch requests authenticate automatically on the same origin. Never expose the process token to browser JavaScript.
 
 ### Server → Client: Events
 
@@ -321,16 +334,21 @@ curl http://localhost:3000/api/models \
 ### JavaScript (Browser)
 
 ```javascript
-// Create session
+// A desktop shell or trusted backend performs this once. Do not embed the token
+// in browser-delivered JavaScript in a real application.
+await fetch('http://localhost:3000/api/auth/session', {
+  method: 'POST',
+  headers: { Authorization: 'Bearer my-token' }
+});
+
+// Create session using the HttpOnly authentication cookie.
 const { sessionId } = await fetch('http://localhost:3000/api/sessions', {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json', Authorization: 'Bearer my-token' },
+  headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ cwd: '/tmp' })
 }).then(r => r.json());
 
 // Connect WebSocket
-// This direct connection works only when auth is disabled for local development.
-// In authenticated deployments, connect through a same-origin backend/proxy.
 const ws = new WebSocket(`ws://localhost:3000/ws?session_id=${sessionId}`);
 
 ws.onmessage = (event) => {
@@ -341,7 +359,7 @@ ws.onmessage = (event) => {
 // Send prompt
 await fetch(`http://localhost:3000/api/sessions/${sessionId}/prompt`, {
   method: 'POST',
-  headers: { 'Content-Type': 'application/json', Authorization: 'Bearer my-token' },
+  headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ message: 'Hello!' })
 });
 ```
@@ -352,7 +370,7 @@ The built-in token is process-wide authentication, not tenant authorization. For
 
 1. **Process isolation**: Run one Pi process or container per trust domain. Do not expose one process directly to mutually untrusted tenants.
 2. **Session isolation**: Each `POST /api/sessions` creates an isolated `SessionManager` and `AgentSessionRuntime` within that process.
-3. **Resource limits**: Monitor runtime count and active turns via `GET /api/health`. Configure `PI_WEB_MAX_RUNTIMES`, `PI_WEB_MAX_CONCURRENT_TURNS`, and `PI_WEB_IDLE_TIMEOUT_MS`, and enforce process-level CPU and memory limits externally.
+3. **Resource limits**: Monitor runtime count and active turns via `GET /api/health`. Configure `PI_ORBIT_MAX_RUNTIMES`, `PI_ORBIT_MAX_CONCURRENT_TURNS`, and `PI_ORBIT_IDLE_TIMEOUT_MS`, and enforce process-level CPU and memory limits externally.
 4. **Containerization**: Run each Pi instance in a container. See [containerization.md](containerization.md) for patterns.
 
 ## WebSocket Implementation

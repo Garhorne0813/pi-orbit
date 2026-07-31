@@ -2,18 +2,26 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Renamed Web mode environment variables from `PI_WEB_*` to `PI_ORBIT_*`; the old names are no longer read.
+
 ### Added
 
 - Added Web mode REST parity for queued messages, agent cancellation, queue and retry settings, model and thinking cycling, session switching, commands, fork messages, and assistant text.
 - Added a session-isolated WebSocket extension UI protocol with dialog responses, cancellation, timeouts, and fire-and-forget UI updates.
+- Added Web mode project-trust endpoints, browser session-cookie authentication, workspace metadata, and runtime initialization diagnostics.
 
 ### Changed
 
+- Renamed the unofficial distribution and standalone binary artifacts from Pi Web to Pi Orbit.
 - Replaced Web mode's hand-written Node.js HTTP and WebSocket protocol implementation with the maintained Hono Node and `ws` adapters.
+- Changed Web mode runtime creation to inherit the host session directory when omitted, bind each runtime to one canonical workspace, and disable CORS by default.
 
 ### Fixed
 
 - Fixed Web mode session isolation, runtime replacement event rebinding, default-session deletion, session naming, authentication configuration, and prompt response semantics.
+- Fixed runtime prompt rate limiting to use independent runtime buckets.
 
 ## [0.82.1] - 2026-07-25
 

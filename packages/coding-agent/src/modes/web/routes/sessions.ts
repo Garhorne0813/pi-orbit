@@ -7,7 +7,14 @@ import {
 	isRenameSessionRequest,
 	isSwitchSessionRequest,
 } from "../types.ts";
-import { RuntimeBusyError, SessionInUseError, type WebSessionHost } from "../web-session-host.ts";
+import {
+	ProjectTrustRequiredError,
+	RuntimeBusyError,
+	RuntimeInitializationError,
+	RuntimeWorkspaceMismatchError,
+	SessionInUseError,
+	type WebSessionHost,
+} from "../web-session-host.ts";
 
 export interface SessionRoutesDeps {
 	sessionHost: WebSessionHost;
@@ -30,6 +37,19 @@ export function registerSessionRoutes(app: Hono, deps: SessionRoutesDeps): void 
 		try {
 			return context.json(await sessionHost.createSession(body), 201);
 		} catch (error) {
+			if (error instanceof ProjectTrustRequiredError) {
+				return context.json({ error: error.message, code: "project_trust_required", cwd: error.cwd } as const, 409);
+			}
+			if (error instanceof RuntimeInitializationError) {
+				return context.json(
+					{
+						error: error.message,
+						code: "runtime_initialization_failed",
+						diagnostics: error.diagnostics,
+					} as const,
+					422,
+				);
+			}
 			const details = error instanceof Error ? error.message : String(error);
 			const status = details === "Session name must be non-empty" ? 400 : 500;
 			return context.json({ error: "Failed to create session", details } as const, status);
@@ -174,6 +194,17 @@ export function registerSessionRoutes(app: Hono, deps: SessionRoutesDeps): void 
 						piSessionId: error.piSessionId,
 						ownerRuntimeId: error.runtimeId,
 					} as const,
+					409,
+				);
+			}
+			if (error instanceof RuntimeWorkspaceMismatchError) {
+				return context.json(
+					{
+						error: error.message,
+						code: "runtime_workspace_mismatch",
+						workspaceCwd: error.workspaceCwd,
+						sessionCwd: error.sessionCwd,
+					},
 					409,
 				);
 			}
