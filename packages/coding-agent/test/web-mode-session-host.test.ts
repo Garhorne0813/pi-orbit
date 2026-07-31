@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
@@ -30,13 +30,13 @@ describe("web session host", () => {
 			idleTimeoutMs?: number;
 			eventBufferSize?: number;
 			disposeTimeoutMs?: number;
-			failRuntimeCreationForCwd?: string;
 			failRuntimeCreationAfter?: number;
 		} = {},
 	) {
 		const { eventBufferSize, ...hostOptions } = options;
-		const root = join(tmpdir(), `pi-web-host-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		mkdirSync(root, { recursive: true });
+		const rootPath = join(tmpdir(), `pi-web-host-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(rootPath, { recursive: true });
+		const root = realpathSync(rootPath);
 		const faux = registerFauxProvider();
 		faux.setResponses([
 			fauxAssistantMessage("first response"),
@@ -78,8 +78,8 @@ describe("web session host", () => {
 		}) => {
 			runtimeCreationCount++;
 			if (
-				options.failRuntimeCreationForCwd === cwd ||
-				(options.failRuntimeCreationAfter !== undefined && runtimeCreationCount > options.failRuntimeCreationAfter)
+				options.failRuntimeCreationAfter !== undefined &&
+				runtimeCreationCount > options.failRuntimeCreationAfter
 			) {
 				throw new Error("runtime factory failed");
 			}
@@ -188,12 +188,10 @@ describe("web session host", () => {
 	});
 
 	it("keeps the current session usable when resume runtime creation fails", async () => {
-		const failureCwd = join(tmpdir(), `pi-web-failed-resume-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		mkdirSync(failureCwd, { recursive: true });
 		const { host, connectionManager, defaultRuntime, root } = await createHarness({
-			failRuntimeCreationForCwd: failureCwd,
+			failRuntimeCreationAfter: 1,
 		});
-		const target = SessionManager.create(failureCwd, join(root, "resume-targets"));
+		const target = SessionManager.create(root, join(root, "resume-targets"));
 		target.appendMessage({ role: "user", content: "target", timestamp: Date.now() });
 		target.appendMessage(fauxAssistantMessage("target response"));
 		const targetPath = target.getSessionFile();
@@ -204,7 +202,7 @@ describe("web session host", () => {
 			host.resumeRuntime(host.defaultRuntimeId, {
 				sessionPath: targetPath,
 				piSessionId: target.getSessionId(),
-				cwdOverride: failureCwd,
+				cwdOverride: root,
 			}),
 		).rejects.toThrow("runtime factory failed");
 
