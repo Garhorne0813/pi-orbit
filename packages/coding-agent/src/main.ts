@@ -55,7 +55,7 @@ import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode, runWebMode } from "./modes/index.ts";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
-import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
+import { canonicalizePath, isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
 
 const EXTENSION_LOAD_FAILURE_HINT = 'Hint: Start without extensions using "pi -ne".';
@@ -662,6 +662,27 @@ export async function main(args: string[], options?: MainOptions) {
 			: undefined;
 	const trustPromptMode: AppMode = parsed.help || parsed.listModels !== undefined ? "print" : appMode;
 	const projectTrustByCwd = new Map<string, boolean>();
+	const getProjectTrustStatus = (targetCwd: string) => {
+		const resolvedCwd = canonicalizePath(resolvePath(targetCwd));
+		const required = hasTrustRequiringProjectResources(resolvedCwd);
+		let decision = projectTrustByCwd.get(resolvedCwd) ?? trustStore.get(resolvedCwd);
+		if (decision === null) {
+			const defaultDecision = startupSettingsManager.getDefaultProjectTrust();
+			if (defaultDecision === "always") decision = true;
+			if (defaultDecision === "never") decision = false;
+		}
+		return { cwd: resolvedCwd, required, decision: required ? decision : true };
+	};
+	const projectTrustController = {
+		getStatus: getProjectTrustStatus,
+		setDecision: (targetCwd: string, decision: boolean | null) => {
+			const resolvedCwd = canonicalizePath(resolvePath(targetCwd));
+			trustStore.set(resolvedCwd, decision);
+			if (decision === null) projectTrustByCwd.delete(resolvedCwd);
+			else projectTrustByCwd.set(resolvedCwd, decision);
+			return getProjectTrustStatus(resolvedCwd);
+		},
+	};
 
 	const resolvedExtensionPaths = resolveCliPaths(cwd, parsed.extensions);
 	const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
@@ -882,6 +903,7 @@ export async function main(args: string[], options?: MainOptions) {
 			appManaged: parsed.webAppManaged,
 			factory: createRuntime,
 			agentDir,
+			projectTrustController,
 		});
 	} else if (appMode === "interactive") {
 		const interactiveMode = new InteractiveMode(runtime, {

@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { copyFileSync, existsSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
@@ -38,6 +38,8 @@ describe("web mode server", () => {
 			persistedSession?: boolean;
 			maxConcurrentTurns?: number;
 			requestBodyLimitBytes?: number;
+			projectTrustRequired?: boolean;
+			runtimeInitializationError?: string;
 		} = {},
 	) {
 		const root = join(tmpdir(), `pi-web-server-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -89,7 +91,7 @@ describe("web mode server", () => {
 					noThemes: true,
 				},
 			});
-			return {
+			const runtime = {
 				...(await createAgentSessionFromServices({
 					services,
 					sessionManager,
@@ -97,8 +99,12 @@ describe("web mode server", () => {
 					model: faux.getModel(),
 				})),
 				services,
-				diagnostics: services.diagnostics,
+				diagnostics:
+					options.runtimeInitializationError === undefined
+						? services.diagnostics
+						: [{ type: "error" as const, message: options.runtimeInitializationError }],
 			};
+			return runtime;
 		};
 		const defaultRuntime = await createAgentSessionRuntime(factory, {
 			cwd: root,
@@ -108,18 +114,30 @@ describe("web mode server", () => {
 				: SessionManager.inMemory(root),
 		});
 		const connectionManager = new ConnectionManager();
+		const projectTrustDecisions = new Map<string, boolean | null>();
+		const getProjectTrustStatus = (cwd: string) => {
+			const workspaceCwd = realpathSync(cwd);
+			return {
+				cwd: workspaceCwd,
+				required: options.projectTrustRequired === true,
+				decision: options.projectTrustRequired === true ? (projectTrustDecisions.get(workspaceCwd) ?? null) : true,
+			};
+		};
+		const projectTrustController = {
+			getStatus: getProjectTrustStatus,
+			setDecision: (cwd: string, decision: boolean | null) => {
+				projectTrustDecisions.set(realpathSync(cwd), decision);
+				return getProjectTrustStatus(cwd);
+			},
+		};
 		const sessionHost = new WebSessionHost({
 			defaultRuntime,
 			connectionManager,
 			createRuntime: (cwd, sessionManager, environment) =>
 				createAgentSessionRuntime(factory, { cwd, agentDir: root, sessionManager, environment }),
-			createSessionManager: (cwd, runtimeOptions) =>
-				runtimeOptions?.sessionPath
-					? SessionManager.open(runtimeOptions.sessionPath, runtimeOptions.sessionDir, cwd)
-					: runtimeOptions?.sessionDir
-						? SessionManager.create(cwd, runtimeOptions.sessionDir)
-						: SessionManager.inMemory(cwd),
+			createSessionManager: createDefaultWebSessionManagerFactory(defaultRuntime.session.sessionManager),
 			maxConcurrentTurns: options.maxConcurrentTurns,
+			projectTrustController,
 		});
 		await sessionHost.initialize();
 		const serverHost = new WebServerHost(
@@ -130,6 +148,7 @@ describe("web mode server", () => {
 				promptRateLimit: options.promptRateLimit,
 				corsOrigin: options.corsOrigin,
 				requestBodyLimitBytes: options.requestBodyLimitBytes,
+				projectTrustController,
 			}),
 			{ heartbeatIntervalMs: options.heartbeatIntervalMs },
 		);
@@ -221,6 +240,21 @@ describe("web mode server", () => {
 		const fetched = await fetch(`${baseUrl}/api/runtimes/${descriptor.runtimeId}`);
 		expect(fetched.status).toBe(200);
 		expect(await fetched.json()).toMatchObject(descriptor);
+	});
+
+	it("uses the host session directory when runtime sessionDir is omitted", async () => {
+		const { baseUrl, root } = await createHarness({ persistedSession: true });
+		const response = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ cwd: root }),
+		});
+
+		expect(response.status).toBe(201);
+		expect(await response.json()).toMatchObject({
+			workspaceCwd: realpathSync(root),
+			persisted: true,
+		});
 	});
 
 	it("reports runtime capacity, activity, and event buffer metrics in health checks", async () => {
@@ -319,6 +353,93 @@ describe("web mode server", () => {
 		expect(resumed.getSessionId()).toBe(created.getSessionId());
 		expect(resumed.getEntries()).toHaveLength(created.getEntries().length);
 		expect(sessionPath).not.toContain(startupDir);
+	});
+
+	it("rejects cross-workspace runtime creation and resume", async () => {
+		const { baseUrl, root } = await createHarness();
+		const firstWorkspace = join(root, "workspace-a");
+		const secondWorkspace = join(root, "workspace-b");
+		mkdirSync(firstWorkspace, { recursive: true });
+		mkdirSync(secondWorkspace, { recursive: true });
+		const source = SessionManager.create(secondWorkspace, join(root, "source-sessions"));
+		source.appendMessage({ role: "user", content: "source", timestamp: Date.now() });
+		source.appendMessage(fauxAssistantMessage("source response"));
+		const sourcePath = source.getSessionFile();
+		if (!sourcePath) throw new Error("missing source session path");
+
+		const mismatchedCreate = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				cwd: firstWorkspace,
+				sessionDir: join(root, "target-sessions"),
+				sessionPath: sourcePath,
+			}),
+		});
+		expect(mismatchedCreate.status).toBe(409);
+		expect(await mismatchedCreate.json()).toMatchObject({ code: "runtime_workspace_mismatch" });
+
+		const target = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ cwd: firstWorkspace, sessionDir: join(root, "target-sessions") }),
+		});
+		const { runtimeId } = (await target.json()) as { runtimeId: string };
+		const mismatchedResume = await fetch(`${baseUrl}/api/runtimes/${runtimeId}/resume`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ sessionPath: sourcePath }),
+		});
+		expect(mismatchedResume.status).toBe(409);
+		expect(await mismatchedResume.json()).toMatchObject({ code: "runtime_workspace_mismatch" });
+	});
+
+	it("requires an explicit project trust decision before creating a runtime", async () => {
+		const { baseUrl, root } = await createHarness({ projectTrustRequired: true });
+		const createRuntime = () =>
+			fetch(`${baseUrl}/api/runtimes`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ cwd: root }),
+			});
+
+		const blocked = await createRuntime();
+		expect(blocked.status).toBe(409);
+		expect(await blocked.json()).toMatchObject({ code: "project_trust_required", cwd: realpathSync(root) });
+		const blockedLegacySession = await fetch(`${baseUrl}/api/sessions`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ cwd: root }),
+		});
+		expect(blockedLegacySession.status).toBe(409);
+		expect(await blockedLegacySession.json()).toMatchObject({ code: "project_trust_required" });
+
+		const status = await fetch(`${baseUrl}/api/project-trust?cwd=${encodeURIComponent(root)}`);
+		expect(await status.json()).toEqual({ cwd: realpathSync(root), required: true, decision: null });
+		const decision = await fetch(`${baseUrl}/api/project-trust`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ cwd: root, decision: true }),
+		});
+		expect(decision.status).toBe(200);
+		expect(await decision.json()).toEqual({ cwd: realpathSync(root), required: true, decision: true });
+		expect((await createRuntime()).status).toBe(201);
+	});
+
+	it("returns runtime initialization diagnostics instead of a partially usable runtime", async () => {
+		const { baseUrl, root } = await createHarness({ runtimeInitializationError: "extension failed" });
+		const response = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ cwd: root }),
+		});
+
+		expect(response.status).toBe(422);
+		expect(await response.json()).toEqual({
+			error: "Runtime initialization failed",
+			code: "runtime_initialization_failed",
+			diagnostics: [{ type: "error", message: "extension failed" }],
+		});
 	});
 
 	it("rejects opening a persisted Pi session that is already owned by another runtime", async () => {
@@ -450,7 +571,7 @@ describe("web mode server", () => {
 
 	it("applies runtime-scoped execution environments without changing process.env", async () => {
 		const { baseUrl, root } = await createHarness();
-		const key = `PI_WEB_RUNTIME_ENV_${Date.now()}`;
+		const key = `PI_ORBIT_RUNTIME_ENV_${Date.now()}`;
 		const original = process.env[key];
 		const createRuntime = async (value: string) => {
 			const response = await fetch(`${baseUrl}/api/runtimes`, {
@@ -585,7 +706,7 @@ describe("web mode server", () => {
 		await expect(selection).resolves.toBeUndefined();
 		ui.notify("notice", "warning");
 		ui.setStatus("build", "running");
-		ui.setTitle("Pi Web");
+		ui.setTitle("Pi Orbit");
 		ui.setEditorText("draft");
 		ui.setWidget("summary", ["line"], { placement: "belowEditor" });
 		await new Promise((resolve) => setTimeout(resolve, 10));
@@ -945,6 +1066,29 @@ describe("web mode server", () => {
 		expect((await request()).status).toBe(429);
 	});
 
+	it("rate limits runtime prompts independently", async () => {
+		const { baseUrl, sessionHost, root } = await createHarness({
+			configureApiKey: false,
+			promptRateLimit: { limit: 1, windowMs: 60_000 },
+		});
+		const created = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ cwd: root, sessionDir: join(root, "rate-limit-sessions") }),
+		});
+		const { runtimeId } = (await created.json()) as { runtimeId: string };
+		const prompt = (id: string) =>
+			fetch(`${baseUrl}/api/runtimes/${id}/prompt`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ message: "hello" }),
+			});
+
+		expect((await prompt(sessionHost.defaultRuntimeId)).status).toBe(500);
+		expect((await prompt(sessionHost.defaultRuntimeId)).status).toBe(429);
+		expect((await prompt(runtimeId)).status).toBe(500);
+	});
+
 	it("limits concurrent agent turns across runtimes and releases capacity when a turn ends", async () => {
 		const { baseUrl, sessionHost, root } = await createHarness({ maxConcurrentTurns: 1 });
 		const firstRuntimeId = sessionHost.defaultRuntimeId;
@@ -1173,18 +1317,22 @@ describe("web mode server", () => {
 		expect(reopened.status).toBe(201);
 	});
 
-	it("resolves environment authentication once and rejects invalid environment ports", () => {
-		expect(resolveWebModeOptions({}, { PI_WEB_AUTH_TOKEN: "from-env" }).authToken).toBe("from-env");
-		expect(resolveWebModeOptions({}, { PI_WEB_CORS_ORIGIN: "https://control.example" }).corsOrigin).toBe(
+	it("resolves Pi Orbit environment settings and ignores the retired Pi Web names", () => {
+		expect(resolveWebModeOptions({}, { PI_ORBIT_AUTH_TOKEN: "from-env" }).authToken).toBe("from-env");
+		expect(resolveWebModeOptions({}, { PI_ORBIT_CORS_ORIGIN: "https://control.example" }).corsOrigin).toBe(
 			"https://control.example",
 		);
-		expect(() => resolveWebModeOptions({}, { PI_WEB_PORT: "invalid" })).toThrow("Invalid web port");
+		expect(() => resolveWebModeOptions({}, { PI_ORBIT_PORT: "invalid" })).toThrow("Invalid web port");
+		expect(resolveWebModeOptions({}, { PI_WEB_AUTH_TOKEN: "legacy", PI_WEB_PORT: "invalid" })).toMatchObject({
+			authToken: undefined,
+			port: 3000,
+		});
 		expect(
 			resolveWebModeOptions(
 				{},
 				{
-					PI_WEB_RUNTIME_DISPOSE_TIMEOUT_MS: "2500",
-					PI_WEB_SHUTDOWN_TIMEOUT_MS: "5000",
+					PI_ORBIT_RUNTIME_DISPOSE_TIMEOUT_MS: "2500",
+					PI_ORBIT_SHUTDOWN_TIMEOUT_MS: "5000",
 				},
 			),
 		).toMatchObject({ disposeTimeoutMs: 2500, shutdownTimeoutMs: 5000 });
@@ -1211,11 +1359,37 @@ describe("web mode server", () => {
 			authToken: "secret",
 			corsOrigin: null,
 		});
-		expect(resolveWebModeOptions({}, { PI_WEB_APP_MANAGED: "1", PI_WEB_AUTH_TOKEN: "from-env" })).toMatchObject({
+		expect(resolveWebModeOptions({}, { PI_ORBIT_APP_MANAGED: "1", PI_ORBIT_AUTH_TOKEN: "from-env" })).toMatchObject({
 			appManaged: true,
 			authToken: "from-env",
 			corsOrigin: null,
 		});
+	});
+
+	it("disables cross-origin access by default on loopback", () => {
+		expect(resolveWebModeOptions({}, {})).toMatchObject({ host: "127.0.0.1", corsOrigin: null });
+	});
+
+	it("exchanges a bearer token for a browser session cookie", async () => {
+		const { baseUrl, wsUrl, sessionHost } = await createHarness({ authToken: "secret" });
+		const bootstrap = await fetch(`${baseUrl}/api/auth/session`, {
+			method: "POST",
+			headers: { Authorization: "Bearer secret" },
+		});
+		expect(bootstrap.status).toBe(204);
+		const cookie = bootstrap.headers.get("set-cookie");
+		expect(cookie).toContain("pi_web_auth=");
+		expect(cookie).toContain("HttpOnly");
+		expect(cookie).toContain("SameSite=Strict");
+		if (!cookie) throw new Error("missing auth cookie");
+
+		const sessions = await fetch(`${baseUrl}/api/sessions`, { headers: { Cookie: cookie } });
+		expect(sessions.status).toBe(200);
+		const websocket = new WebSocket(`${wsUrl}/ws?session_id=${sessionHost.defaultSessionId}`, {
+			headers: { Cookie: cookie },
+		});
+		await once(websocket, "open");
+		websocket.close();
 	});
 
 	it("omits CORS response headers when cross-origin access is disabled", async () => {

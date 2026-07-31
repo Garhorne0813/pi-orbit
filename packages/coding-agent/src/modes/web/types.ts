@@ -8,15 +8,15 @@ import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 
 /** Options passed to runWebMode */
 export interface WebModeOptions {
-	/** HTTP server port (default: 3000 or PI_WEB_PORT env var) */
+	/** HTTP server port (default: 3000 or PI_ORBIT_PORT env var) */
 	port?: number;
-	/** HTTP server host (default: 127.0.0.1 or PI_WEB_HOST env var) */
+	/** HTTP server host (default: 127.0.0.1 or PI_ORBIT_HOST env var) */
 	host?: string;
-	/** Bearer token for API authentication (default: PI_WEB_AUTH_TOKEN env var) */
+	/** Bearer token for API authentication (default: PI_ORBIT_AUTH_TOKEN env var) */
 	authToken?: string;
 	/** Require authentication and restrictive CORS defaults for app-managed processes. */
 	appManaged?: boolean;
-	/** Allowed CORS origin (default: PI_WEB_CORS_ORIGIN, disabled in app-managed mode, otherwise *). */
+	/** Allowed CORS origin (default: PI_ORBIT_CORS_ORIGIN, otherwise disabled). */
 	corsOrigin?: string;
 	/** Maximum runtimes held by one web host, including the startup runtime. */
 	maxRuntimes?: number;
@@ -46,7 +46,10 @@ export interface RuntimeDescriptor {
 	runtimeId: string;
 	piSessionId: string;
 	sessionPath: string | null;
+	sessionDir: string | null;
 	cwd: string;
+	workspaceCwd: string;
+	persisted: boolean;
 	createdAt: number;
 	lastActivityAt: number;
 	busy: boolean;
@@ -55,15 +58,34 @@ export interface RuntimeDescriptor {
 	thinking: string | null;
 	isStreaming: boolean;
 	isCompacting: boolean;
+	diagnostics: readonly { type: "info" | "warning" | "error"; message: string }[];
 }
 
 export interface CreateRuntimeRequest {
 	cwd: string;
-	sessionDir: string;
+	sessionDir?: string;
 	sessionPath?: string;
+	/** Explicitly relocate a persisted session to cwd. Must equal cwd when provided. */
+	cwdOverride?: string;
 	model?: string;
 	thinking?: string;
 	runtimeEnv?: Record<string, string | null>;
+}
+
+export interface ProjectTrustStatus {
+	cwd: string;
+	required: boolean;
+	decision: boolean | null;
+}
+
+export interface WebProjectTrustController {
+	getStatus(cwd: string): ProjectTrustStatus;
+	setDecision(cwd: string, decision: boolean | null): ProjectTrustStatus;
+}
+
+export interface SetProjectTrustRequest {
+	cwd: string;
+	decision: boolean | null;
 }
 
 export interface ResumeRuntimeRequest {
@@ -101,6 +123,10 @@ export interface RuntimeCapabilities {
 		commandCatalog: true;
 		runtimeEnvironment: true;
 		runtimeResourceOverrides: false;
+		browserSessionAuth: true;
+		workspaceBinding: true;
+		projectTrustApi: true;
+		legacySessionApi: true;
 		idleEviction: true;
 	};
 }
@@ -123,6 +149,10 @@ export const RUNTIME_CAPABILITIES: Omit<RuntimeCapabilities, "piVersion"> = {
 		commandCatalog: true,
 		runtimeEnvironment: true,
 		runtimeResourceOverrides: false,
+		browserSessionAuth: true,
+		workspaceBinding: true,
+		projectTrustApi: true,
+		legacySessionApi: true,
 		idleEviction: true,
 	},
 };
@@ -231,6 +261,7 @@ export interface ApiError {
 /** In-memory session entry managed by the web mode */
 export interface WebSessionEntry {
 	runtime: AgentSessionRuntime;
+	workspaceCwd: string;
 	createdAt: number;
 	lastActivityAt: number;
 	/** True for the default session seeded at startup (not disposable via DELETE) */
@@ -304,12 +335,20 @@ export function isCreateSessionRequest(data: unknown): data is CreateSessionRequ
 export function isCreateRuntimeRequest(data: unknown): data is CreateRuntimeRequest {
 	if (typeof data !== "object" || data === null) return false;
 	const object = data as Record<string, unknown>;
-	if (!hasNonEmptyString(object, "cwd") || !hasNonEmptyString(object, "sessionDir")) return false;
+	if (!hasNonEmptyString(object, "cwd")) return false;
+	if (object.sessionDir !== undefined && !hasNonEmptyString(object, "sessionDir")) return false;
 	if (object.sessionPath !== undefined && !hasNonEmptyString(object, "sessionPath")) return false;
+	if (object.cwdOverride !== undefined && !hasNonEmptyString(object, "cwdOverride")) return false;
 	if (object.model !== undefined && !hasNonEmptyString(object, "model")) return false;
 	if (object.thinking !== undefined && !hasNonEmptyString(object, "thinking")) return false;
 	if (object.runtimeEnv !== undefined && !isRuntimeEnvironment(object.runtimeEnv)) return false;
 	return object.skills === undefined && object.extensions === undefined;
+}
+
+export function isSetProjectTrustRequest(data: unknown): data is SetProjectTrustRequest {
+	if (!hasNonEmptyString(data, "cwd")) return false;
+	const decision = (data as Record<string, unknown>).decision;
+	return decision === true || decision === false || decision === null;
 }
 
 function isRuntimeEnvironment(value: unknown): value is Record<string, string | null> {

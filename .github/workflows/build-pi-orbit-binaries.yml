@@ -1,4 +1,4 @@
-name: Build Pi Web Binaries
+name: Build Pi Orbit Binaries
 
 on:
   workflow_dispatch:
@@ -14,14 +14,14 @@ on:
         default: false
         type: boolean
       release_tag:
-        description: Release tag (required when creating a release, for example pi-web-v0.1.0)
+        description: Release tag (required when creating a release, for example pi-orbit-v0.1.0)
         required: false
         type: string
 
 permissions: {}
 
 concurrency:
-  group: build-pi-web-binaries-${{ github.run_id }}
+  group: build-pi-orbit-binaries-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -58,12 +58,12 @@ jobs:
             --offline-model-data \
             --out "${GITHUB_WORKSPACE}/packages/coding-agent/binaries"
 
-      - name: Package Pi Web executables
+      - name: Package Pi Orbit executables
         run: |
           set -euo pipefail
 
           binaries_dir="${GITHUB_WORKSPACE}/packages/coding-agent/binaries"
-          assets_dir="${GITHUB_WORKSPACE}/pi-web-assets"
+          assets_dir="${GITHUB_WORKSPACE}/pi-orbit-assets"
           work_dir="$(mktemp -d)"
           trap 'rm -rf "${work_dir}"' EXIT
           mkdir -p "${assets_dir}"
@@ -73,31 +73,31 @@ jobs:
             platform_dir="${work_dir}/${platform}"
             mkdir -p "${platform_dir}"
             tar -xzf "${binaries_dir}/pi-${platform}.tar.gz" -C "${platform_dir}"
-            mv "${platform_dir}/pi" "${platform_dir}/pi-web"
-            mv "${platform_dir}/pi-web/pi" "${platform_dir}/pi-web/pi-web"
-            tar -czf "${assets_dir}/pi-web-${platform}.tar.gz" -C "${platform_dir}" pi-web
+            mv "${platform_dir}/pi" "${platform_dir}/pi-orbit"
+            mv "${platform_dir}/pi-orbit/pi" "${platform_dir}/pi-orbit/pi-orbit"
+            tar -czf "${assets_dir}/pi-orbit-${platform}.tar.gz" -C "${platform_dir}" pi-orbit
           done
 
           windows_platforms=(windows-x64 windows-arm64)
           for platform in "${windows_platforms[@]}"; do
-            platform_dir="${work_dir}/${platform}/pi-web"
+            platform_dir="${work_dir}/${platform}/pi-orbit"
             mkdir -p "${platform_dir}"
             unzip -q "${binaries_dir}/pi-${platform}.zip" -d "${platform_dir}"
-            mv "${platform_dir}/pi.exe" "${platform_dir}/pi-web.exe"
+            mv "${platform_dir}/pi.exe" "${platform_dir}/pi-orbit.exe"
             (
               cd "${work_dir}/${platform}"
-              zip -qr "${assets_dir}/pi-web-${platform}.zip" pi-web
+              zip -qr "${assets_dir}/pi-orbit-${platform}.zip" pi-orbit
             )
           done
 
           cd "${assets_dir}"
-          sha256sum pi-web-*.tar.gz pi-web-*.zip > SHA256SUMS
+          sha256sum pi-orbit-*.tar.gz pi-orbit-*.zip > SHA256SUMS
 
-      - name: Upload Pi Web binaries
+      - name: Upload Pi Orbit binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: pi-web-binaries-${{ github.run_number }}
-          path: pi-web-assets/*
+          name: pi-orbit-binaries-${{ github.run_number }}
+          path: pi-orbit-assets/*
           if-no-files-found: error
           retention-days: 14
 
@@ -121,11 +121,11 @@ jobs:
             exit 1
           fi
 
-      - name: Download Pi Web binaries
+      - name: Download Pi Orbit binaries
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: pi-web-binaries-${{ github.run_number }}
-          path: pi-web-assets
+          name: pi-orbit-binaries-${{ github.run_number }}
+          path: pi-orbit-assets
 
       - name: Create GitHub Release
         env:
@@ -143,6 +143,6 @@ jobs:
 
           gh release create "${RELEASE_TAG}" \
             --target "${SOURCE_REF}" \
-            --title "Pi Web ${RELEASE_TAG}" \
+            --title "Pi Orbit ${RELEASE_TAG}" \
             --generate-notes \
-            pi-web-assets/*
+            pi-orbit-assets/*

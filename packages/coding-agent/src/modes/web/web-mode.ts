@@ -8,7 +8,7 @@ import {
 import { SessionManager } from "../../core/session-manager.ts";
 import { WebAccessPolicy } from "./middleware/auth.ts";
 import { createApp, WebServerHost } from "./server.ts";
-import type { WebModeOptions } from "./types.ts";
+import type { WebModeOptions, WebProjectTrustController } from "./types.ts";
 import { WebSessionHost, type WebSessionManagerFactory } from "./web-session-host.ts";
 import { ConnectionManager } from "./ws/connection-manager.ts";
 
@@ -16,6 +16,7 @@ export interface RunWebModeOptions extends WebModeOptions {
 	factory: CreateAgentSessionRuntimeFactory;
 	agentDir: string;
 	createSessionManager?: WebSessionManagerFactory;
+	projectTrustController?: WebProjectTrustController;
 }
 
 export interface ResolvedWebModeOptions {
@@ -36,32 +37,32 @@ export function resolveWebModeOptions(
 	options: WebModeOptions,
 	environment: NodeJS.ProcessEnv = process.env,
 ): ResolvedWebModeOptions {
-	const rawPort = options.port ?? Number(environment.PI_WEB_PORT ?? "3000");
+	const rawPort = options.port ?? Number(environment.PI_ORBIT_PORT ?? "3000");
 	if (!Number.isInteger(rawPort) || rawPort < 1 || rawPort > 65535) {
-		throw new Error(`Invalid web port: ${environment.PI_WEB_PORT ?? String(rawPort)}`);
+		throw new Error(`Invalid web port: ${environment.PI_ORBIT_PORT ?? String(rawPort)}`);
 	}
-	const rawToken = options.authToken ?? environment.PI_WEB_AUTH_TOKEN;
+	const rawToken = options.authToken ?? environment.PI_ORBIT_AUTH_TOKEN;
 	const authToken = rawToken && rawToken.length > 0 ? rawToken : undefined;
-	const appManaged = options.appManaged ?? isEnabled(environment.PI_WEB_APP_MANAGED);
-	const host = options.host ?? environment.PI_WEB_HOST ?? "127.0.0.1";
-	const corsOrigin = options.corsOrigin ?? environment.PI_WEB_CORS_ORIGIN ?? (appManaged ? null : "*");
+	const appManaged = options.appManaged ?? isEnabled(environment.PI_ORBIT_APP_MANAGED);
+	const host = options.host ?? environment.PI_ORBIT_HOST ?? "127.0.0.1";
+	const corsOrigin = options.corsOrigin ?? environment.PI_ORBIT_CORS_ORIGIN ?? null;
 	if (appManaged && authToken === undefined) {
 		throw new Error("Authentication is required in app-managed web mode");
 	}
 	if (!isLoopbackHost(host) && authToken === undefined) {
 		throw new Error("Authentication is required for non-loopback web hosts");
 	}
-	if (!isLoopbackHost(host) && corsOrigin === "*") {
+	if (!isLoopbackHost(host) && (corsOrigin === null || corsOrigin === "*")) {
 		throw new Error("An explicit CORS origin is required for non-loopback web hosts");
 	}
-	const maxRuntimes = options.maxRuntimes ?? Number(environment.PI_WEB_MAX_RUNTIMES ?? "64");
-	const idleTimeoutMs = options.idleTimeoutMs ?? Number(environment.PI_WEB_IDLE_TIMEOUT_MS ?? String(30 * 60_000));
-	const maxConcurrentTurns = options.maxConcurrentTurns ?? Number(environment.PI_WEB_MAX_CONCURRENT_TURNS ?? "4");
+	const maxRuntimes = options.maxRuntimes ?? Number(environment.PI_ORBIT_MAX_RUNTIMES ?? "64");
+	const idleTimeoutMs = options.idleTimeoutMs ?? Number(environment.PI_ORBIT_IDLE_TIMEOUT_MS ?? String(30 * 60_000));
+	const maxConcurrentTurns = options.maxConcurrentTurns ?? Number(environment.PI_ORBIT_MAX_CONCURRENT_TURNS ?? "4");
 	const requestBodyLimitBytes =
-		options.requestBodyLimitBytes ?? Number(environment.PI_WEB_REQUEST_BODY_LIMIT_BYTES ?? String(4 * 1024 * 1024));
+		options.requestBodyLimitBytes ?? Number(environment.PI_ORBIT_REQUEST_BODY_LIMIT_BYTES ?? String(4 * 1024 * 1024));
 	const disposeTimeoutMs =
-		options.disposeTimeoutMs ?? Number(environment.PI_WEB_RUNTIME_DISPOSE_TIMEOUT_MS ?? "10000");
-	const shutdownTimeoutMs = options.shutdownTimeoutMs ?? Number(environment.PI_WEB_SHUTDOWN_TIMEOUT_MS ?? "15000");
+		options.disposeTimeoutMs ?? Number(environment.PI_ORBIT_RUNTIME_DISPOSE_TIMEOUT_MS ?? "10000");
+	const shutdownTimeoutMs = options.shutdownTimeoutMs ?? Number(environment.PI_ORBIT_SHUTDOWN_TIMEOUT_MS ?? "15000");
 	if (!Number.isInteger(maxRuntimes) || maxRuntimes < 1) {
 		throw new Error(`Invalid maximum runtime count: ${maxRuntimes}`);
 	}
@@ -106,7 +107,7 @@ function isLoopbackHost(host: string): boolean {
 export function createDefaultWebSessionManagerFactory(defaultSessionManager: SessionManager): WebSessionManagerFactory {
 	return (cwd, runtimeOptions) => {
 		if (runtimeOptions?.sessionPath) {
-			return SessionManager.open(runtimeOptions.sessionPath, runtimeOptions.sessionDir, cwd);
+			return SessionManager.open(runtimeOptions.sessionPath, runtimeOptions.sessionDir, runtimeOptions.cwdOverride);
 		}
 		if (runtimeOptions?.sessionDir) return SessionManager.create(cwd, runtimeOptions.sessionDir);
 		return defaultSessionManager.isPersisted()
@@ -136,6 +137,7 @@ export async function runWebMode(defaultRuntime: AgentSessionRuntime, options: R
 		idleTimeoutMs: config.idleTimeoutMs,
 		maxConcurrentTurns: config.maxConcurrentTurns,
 		disposeTimeoutMs: config.disposeTimeoutMs,
+		projectTrustController: options.projectTrustController,
 	});
 	await sessionHost.initialize();
 
@@ -147,6 +149,7 @@ export async function runWebMode(defaultRuntime: AgentSessionRuntime, options: R
 			accessPolicy,
 			corsOrigin: config.corsOrigin,
 			requestBodyLimitBytes: config.requestBodyLimitBytes,
+			projectTrustController: options.projectTrustController,
 		}),
 	);
 	let shuttingDown = false;
@@ -179,12 +182,12 @@ export async function runWebMode(defaultRuntime: AgentSessionRuntime, options: R
 			console.error(`[web] Server error: ${error.message}`);
 			requestCleanup(1);
 		});
-		console.error(`[web] Pi web server listening on http://${config.host}:${address.port}`);
+		console.error(`[web] Pi Orbit server listening on http://${config.host}:${address.port}`);
 		console.error(`[web] WebSocket endpoint: ws://${config.host}:${address.port}/ws`);
 		console.error(`[web] Health check: http://${config.host}:${address.port}/api/health`);
 		if (!accessPolicy.authenticationEnabled) {
 			console.error("[web] Warning: No auth token configured. API is open to all connections.");
-			console.error("[web] Set --auth-token or PI_WEB_AUTH_TOKEN to enable authentication.");
+			console.error("[web] Set --auth-token or PI_ORBIT_AUTH_TOKEN to enable authentication.");
 		}
 	} catch (error) {
 		for (const [signal, handler] of signalHandlers) process.off(signal, handler);

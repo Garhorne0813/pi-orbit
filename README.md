@@ -1,6 +1,6 @@
 <div align="center">
-  <h1>Pi Web</h1>
-  <p><strong>An unofficial, Web-focused fork of Pi Agent Harness.</strong></p>
+  <h1>Pi Orbit</h1>
+  <p><strong>An unofficial, runtime-host-focused fork of Pi Agent Harness.</strong></p>
   <p>
     Run Pi interactively, embed it through an SDK or RPC, or serve multiple isolated agent sessions
     from one authenticated HTTP runtime host.
@@ -21,9 +21,9 @@
 
 ---
 
-> **Unofficial fork:** Pi Web is an independent fork of [Pi Agent Harness](https://github.com/earendil-works/pi). It is not affiliated with or endorsed by Mario Zechner or Earendil Works.
+> **Unofficial fork:** Pi Orbit is an independent fork of [Pi Agent Harness](https://github.com/earendil-works/pi). It is not affiliated with or endorsed by Mario Zechner or Earendil Works.
 
-Pi Web builds on Pi, a small agent harness with strong defaults and a deliberately open extension model. Pi provides the agent loop, model integrations, session persistence, terminal UI, tools, and transport layers while leaving product-specific workflows to extensions and host applications.
+Pi Orbit builds on Pi, a small agent harness with strong defaults and a deliberately open extension model. Pi provides the agent loop, model integrations, session persistence, terminal UI, tools, and transport layers while leaving product-specific workflows to extensions and host applications.
 
 This repository includes a first-class Web mode for control planes and browser-facing products. A single `pi --mode web` process can own multiple logically isolated runtimes, each with its own `AgentSessionRuntime`, message history, model state, working directory, and replayable event stream.
 
@@ -50,15 +50,15 @@ Pi intentionally does not impose a built-in workflow such as subagents or plan m
 - Node.js 22.19 or newer
 - An API key, provider subscription, or trusted local model endpoint
 
-### Install Pi Web from source
+### Install Pi Orbit from source
 
 ```bash
-git clone https://github.com/Garhorne0813/pi-web.git
-cd pi-web
+git clone https://github.com/Garhorne0813/pi-orbit.git
+cd pi-orbit
 npm ci --ignore-scripts
 ```
 
-`--ignore-scripts` disables dependency lifecycle scripts; Pi Web does not require them for a normal installation.
+`--ignore-scripts` disables dependency lifecycle scripts; Pi Orbit does not require them for a normal installation.
 
 Configure a provider and start the interactive agent:
 
@@ -88,33 +88,33 @@ Web mode turns Pi into a local agent service and runtime host. One process hosts
 ### Start the server
 
 ```bash
-export PI_WEB_AUTH_TOKEN='replace-with-a-long-random-token'
-export PI_WEB_CORS_ORIGIN='https://your-control-plane.example'
+export PI_ORBIT_AUTH_TOKEN='replace-with-a-long-random-token'
+export PI_ORBIT_CORS_ORIGIN='https://your-control-plane.example'
 
 ./pi-test.sh --mode web --web-app-managed --host 127.0.0.1 --port 3000
 ```
 
 | Setting | Default | Description |
 |---|---|---|
-| `--host`, `PI_WEB_HOST` | `127.0.0.1` | HTTP bind address |
-| `--port`, `PI_WEB_PORT` | `3000` | HTTP port, from 1 to 65535 |
-| `--auth-token`, `PI_WEB_AUTH_TOKEN` | unset | Process-wide Bearer token |
-| `--web-app-managed`, `PI_WEB_APP_MANAGED` | disabled | Require authentication and disable CORS response headers by default |
-| `PI_WEB_CORS_ORIGIN` | `*` | Allowed browser origin |
-| `PI_WEB_MAX_RUNTIMES` | `64` | Maximum hosted runtimes, including the startup runtime |
-| `PI_WEB_MAX_CONCURRENT_TURNS` | `4` | Maximum simultaneous model turns across all runtimes |
-| `PI_WEB_IDLE_TIMEOUT_MS` | `1800000` | Idle lifetime for recoverable persisted runtimes in milliseconds |
-| `PI_WEB_REQUEST_BODY_LIMIT_BYTES` | `4194304` | Maximum HTTP API request body size |
-| `PI_WEB_RUNTIME_DISPOSE_TIMEOUT_MS` | `10000` | Maximum wait for one runtime to dispose |
-| `PI_WEB_SHUTDOWN_TIMEOUT_MS` | `15000` | Maximum graceful host shutdown time |
+| `--host`, `PI_ORBIT_HOST` | `127.0.0.1` | HTTP bind address |
+| `--port`, `PI_ORBIT_PORT` | `3000` | HTTP port, from 1 to 65535 |
+| `--auth-token`, `PI_ORBIT_AUTH_TOKEN` | unset | Process-wide Bearer token |
+| `--web-app-managed`, `PI_ORBIT_APP_MANAGED` | disabled | Require authentication and disable CORS response headers by default |
+| `PI_ORBIT_CORS_ORIGIN` | disabled | Exact browser origin allowed to make cross-origin requests |
+| `PI_ORBIT_MAX_RUNTIMES` | `64` | Maximum hosted runtimes, including the startup runtime |
+| `PI_ORBIT_MAX_CONCURRENT_TURNS` | `4` | Maximum simultaneous model turns across all runtimes |
+| `PI_ORBIT_IDLE_TIMEOUT_MS` | `1800000` | Idle lifetime for recoverable persisted runtimes in milliseconds |
+| `PI_ORBIT_REQUEST_BODY_LIMIT_BYTES` | `4194304` | Maximum HTTP API request body size |
+| `PI_ORBIT_RUNTIME_DISPOSE_TIMEOUT_MS` | `10000` | Maximum wait for one runtime to dispose |
+| `PI_ORBIT_SHUTDOWN_TIMEOUT_MS` | `15000` | Maximum graceful host shutdown time |
 
-The health and capabilities endpoints are public. Loopback development can run without a token. App-managed mode requires a token even on loopback and omits CORS response headers unless `PI_WEB_CORS_ORIGIN` is explicit. Binding to a non-loopback host requires both a Bearer token and an explicit CORS origin; insecure startup is rejected.
+The health and capabilities endpoints are public. Loopback development can run without a token, but CORS response headers are disabled unless `PI_ORBIT_CORS_ORIGIN` is explicit. App-managed mode requires a token even on loopback. Binding to a non-loopback host requires both a Bearer token and an explicit CORS origin; insecure startup is rejected.
 
 ### Create a session and stream events
 
 ```bash
 BASE_URL=http://127.0.0.1:3000
-AUTH_HEADER="Authorization: Bearer $PI_WEB_AUTH_TOKEN"
+AUTH_HEADER="Authorization: Bearer $PI_ORBIT_AUTH_TOKEN"
 
 curl "$BASE_URL/api/health"
 
@@ -141,7 +141,7 @@ The prompt endpoint returns HTTP `202` after prompt preflight succeeds. Generate
 
 ### Runtime Host API
 
-Control planes should use `/api/runtimes`. A `runtimeId` is an ephemeral handle owned by the current Pi Web process; `piSessionId` is the persisted Pi session identity. Session replacement or forking can change `piSessionId` without changing `runtimeId`.
+Control planes should use `/api/runtimes`. A `runtimeId` is an ephemeral handle owned by the current Pi Orbit process; `piSessionId` is the persisted Pi session identity. Session replacement or forking can change `piSessionId` without changing `runtimeId`.
 
 ```bash
 RUNTIME=$(curl -fsS -X POST "$BASE_URL/api/runtimes" \
@@ -160,7 +160,7 @@ curl -N "$BASE_URL/api/runtimes/$RUNTIME_ID/events" -H "$AUTH_HEADER"
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/capabilities` | Negotiate protocol version and runtime-host features |
-| `POST` | `/api/runtimes` | Create or open a runtime with explicit `cwd`, `sessionDir`, and optional `sessionPath` |
+| `POST` | `/api/runtimes` | Create or open a runtime with `cwd` and optional `sessionDir`, `sessionPath`, and `cwdOverride` |
 | `GET` | `/api/runtimes` | List runtime descriptors |
 | `GET` | `/api/runtimes/:runtimeId` | Read both identities, paths, activity, model, and busy state |
 | `GET` | `/api/runtimes/:runtimeId/health` | Read runtime-specific health and protocol information |
@@ -178,10 +178,14 @@ curl -N "$BASE_URL/api/runtimes/$RUNTIME_ID/events" -H "$AUTH_HEADER"
 | `POST` | `/api/runtimes/:runtimeId/ui-response` | Resolve a pending extension UI request over HTTP |
 | `GET` | `/api/runtimes/:runtimeId/events` | Stream versioned runtime event envelopes over SSE |
 | `DELETE` | `/api/runtimes/:runtimeId` | Dispose a dynamic runtime without deleting its JSONL session |
+| `GET` | `/api/project-trust?cwd=<path>` | Read whether project resources require a trust decision |
+| `PUT` | `/api/project-trust` | Persist `{ "cwd": "...", "decision": true|false|null }` |
 
-Creation accepts `model` in `provider/modelId` form and an optional `thinking` level. Runtime descriptors return the active model as `{ "provider": "...", "id": "..." }` plus `qualifiedModel`, so control planes never need to infer a provider from a model ID.
+Creation accepts `model` in `provider/modelId` form and an optional `thinking` level. Omitting `sessionDir` inherits the startup runtime's persistence policy and session directory. A runtime is permanently bound to the canonical `workspaceCwd`; opening or resuming a session from another workspace returns `runtime_workspace_mismatch`. `cwdOverride` is an explicit relocation acknowledgement and must resolve to the same workspace as `cwd`.
 
-Pi Web is a single-user, shared-process runtime host. Provider credentials, `agentDir`, global skills, extensions, and MCP configuration are application-level resources. `runtimeEnv` supplies per-runtime overrides for Pi-managed child processes, including built-in bash, direct bash, and extension `pi.exec`, without changing `process.env`; `null` removes a variable. Runtime-scoped `skills` and `extensions` fields are rejected. Third-party extensions and MCP adapters that spawn processes directly must merge the runtime environment themselves.
+Runtime descriptors expose `workspaceCwd`, `sessionDir`, `persisted`, and resource-loader `diagnostics` in addition to model state. When local extensions, skills, or prompt templates require a trust decision, creation returns `project_trust_required`; use the project-trust API and retry. Loader errors return `runtime_initialization_failed` with diagnostics instead of leaving a partially usable runtime registered.
+
+Pi Orbit is a single-user, shared-process runtime host. Provider credentials, `agentDir`, global skills, extensions, and MCP configuration are application-level resources. `runtimeEnv` supplies per-runtime overrides for Pi-managed child processes, including built-in bash, direct bash, and extension `pi.exec`, without changing `process.env`; `null` removes a variable. Runtime-scoped `skills` and `extensions` fields are rejected. Third-party extensions and MCP adapters that spawn processes directly must merge the runtime environment themselves.
 
 Each persisted session path and `piSessionId` has one runtime owner. Conflicts return HTTP 409 with `session_in_use`. Prompt and exclusive lifecycle operations use separate leases: `steer`, `follow-up`, abort controls, and UI responses remain available during an active turn, while a second prompt, resume, compact, fork, restart, or delete returns `runtime_busy`. Different runtimes can still execute concurrently within the process-wide turn limit.
 
@@ -244,7 +248,7 @@ Legacy session transports provide serialized `AgentSessionEvent` values:
 
 The runtime-host transport uses `GET /api/runtimes/:runtimeId/events`. It subscribes when the runtime is created, not when a client connects, and wraps each event with `protocolVersion`, `runtimeId`, `piSessionId`, monotonic `sequence`, and `timestamp`. Replay-window validation, live registration, and replay snapshotting are atomic, and each SSE client serializes its writes. Supply `Last-Event-ID` or `?after=<sequence>` to replay the in-memory ring buffer. HTTP 409 with `event_replay_gap` means the requested sequence expired; `event_sequence_ahead` means it is newer than the host's current sequence. Both require state reconciliation by the control plane.
 
-For a Pi-Science-style personal desktop migration, one authenticated Pi Web process can host multiple workspace runtimes within one user or trust domain. Keep process supervision, durable event persistence, frontend SSE translation, artifact/review observation, and restart-time `piSessionId -> runtimeId` reconciliation in the control plane. Use separate processes when workspaces require different trust boundaries, credentials, or OS-level isolation. To preserve a source runtime when forking, open its `sessionPath` in a second runtime and fork that second runtime; `/api/runtimes/:runtimeId/fork` intentionally changes the session owned by its existing runtime handle.
+For a personal desktop control plane, one authenticated Pi Orbit process can host multiple workspace runtimes within one user or trust domain. Keep process supervision, durable event persistence, product-specific artifact observation, and restart-time `piSessionId -> runtimeId` reconciliation in the control plane. Use separate processes when workspaces require different trust boundaries, credentials, or OS-level isolation. To preserve a source runtime when forking, open its `sessionPath` in a second runtime and fork that second runtime; `/api/runtimes/:runtimeId/fork` intentionally changes the session owned by its existing runtime handle.
 
 WebSocket clients may also submit a prompt command:
 
@@ -257,11 +261,17 @@ They may abort the active agent run with `{ "type": "abort" }`. Extensions using
 Authenticated WebSocket upgrades must carry `Authorization: Bearer <token>` as an HTTP header. Tokens in URL query parameters are rejected. Node clients and command-line clients such as `websocat` can set the header directly:
 
 ```bash
-websocat -H="Authorization: Bearer $PI_WEB_AUTH_TOKEN" \
+websocat -H="Authorization: Bearer $PI_ORBIT_AUTH_TOKEN" \
   "ws://127.0.0.1:3000/ws?session_id=$SESSION_ID"
 ```
 
-Native browser `WebSocket` and `EventSource` APIs cannot set arbitrary authorization headers. For authenticated browser deployments, place Pi behind a same-origin backend or reverse proxy that authenticates the user and injects the Pi Bearer header. Do not put the token in browser-visible URLs.
+Native browser `WebSocket` and `EventSource` APIs cannot set arbitrary authorization headers. Bootstrap an HttpOnly same-origin cookie once, then use the native browser transports without exposing the token in a URL:
+
+```bash
+curl -i -X POST "$BASE_URL/api/auth/session" -H "$AUTH_HEADER"
+```
+
+The response sets `pi_web_auth` with `HttpOnly` and `SameSite=Strict`. A backend or desktop shell should perform this exchange and keep the Bearer token out of browser JavaScript. `DELETE /api/auth/session` clears the cookie.
 
 ## Architecture
 
@@ -272,7 +282,7 @@ flowchart LR
     CORE --> AI["Multi-provider model API"]
     CORE --> TOOLS["Tools and extensions"]
 
-    subgraph WEB["One Pi Web mode process"]
+    subgraph WEB["One Pi Orbit process in Web mode"]
         API["Hono REST API"]
         EVENTS["Permanent runtime event bus and replay buffer"]
         HOST["WebSessionHost"]
@@ -310,10 +320,10 @@ Pi runs with the permissions of the operating-system user that launches it. The 
 
 For production deployments:
 
-- Always configure `PI_WEB_AUTH_TOKEN` with a long random value.
+- Always configure `PI_ORBIT_AUTH_TOKEN` with a long random value.
 - Bind to localhost unless a trusted network path requires otherwise.
 - Terminate TLS and enforce request-size limits at a reverse proxy.
-- Set `PI_WEB_CORS_ORIGIN` to the exact control-plane origin.
+- Set `PI_ORBIT_CORS_ORIGIN` to the exact control-plane origin.
 - Run separate Pi processes or containers for mutually untrusted users.
 - Apply CPU, memory, filesystem, and network limits outside Pi.
 - Treat the bash endpoint and agent tools as remote code execution within the Pi trust domain.
@@ -327,8 +337,8 @@ See [containerization guidance](packages/coding-agent/docs/containerization.md) 
 If you have not completed the [Quick Start](#quick-start), clone the repository and install the pinned workspace dependencies:
 
 ```bash
-git clone https://github.com/Garhorne0813/pi-web.git
-cd pi-web
+git clone https://github.com/Garhorne0813/pi-orbit.git
+cd pi-orbit
 npm ci --ignore-scripts
 ```
 
@@ -372,6 +382,7 @@ See [AGENTS.md](AGENTS.md) for repository-specific development rules and [CONTRI
 
 - [Coding-agent guide](packages/coding-agent/README.md)
 - [Web mode protocol](packages/coding-agent/docs/web-mode.md)
+- [Web mode generality remediation](packages/coding-agent/docs/pi-orbit-generality-remediation.md)
 - [RPC protocol](packages/coding-agent/docs/rpc.md)
 - [Provider configuration](packages/coding-agent/docs/providers.md)
 - [Extensions](packages/coding-agent/docs/extensions.md)
@@ -388,9 +399,9 @@ Longer-term design work is tracked in the [Pi RFCs](https://rfc.earendil.com/key
 
 ## Acknowledgements
 
-Pi Web is built on [Pi Agent Harness](https://github.com/earendil-works/pi), created by [Mario Zechner](https://github.com/badlogic) and maintained by Earendil Works and its contributors.
+Pi Orbit is built on [Pi Agent Harness](https://github.com/earendil-works/pi), created by [Mario Zechner](https://github.com/badlogic) and maintained by Earendil Works and its contributors.
 
-This fork preserves the upstream MIT license and copyright notice. Pi Web is independently maintained and is not an official Pi distribution.
+This fork preserves the upstream MIT license and copyright notice. Pi Orbit is independently maintained and is not an official Pi distribution.
 
 ## License
 

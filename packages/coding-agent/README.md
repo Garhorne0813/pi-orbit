@@ -492,7 +492,7 @@ See [docs/rpc.md](docs/rpc.md) for the protocol.
 Web mode exposes isolated Pi sessions through REST APIs and streams `AgentSessionEvent` messages over WebSocket:
 
 ```bash
-PI_WEB_AUTH_TOKEN=my-secret-token pi --mode web --port 3000
+PI_ORBIT_AUTH_TOKEN=my-secret-token pi --mode web --port 3000
 ```
 
 The process-wide token grants access to every session in that process. Use a separate process or container for each trust domain. See [docs/web-mode.md](docs/web-mode.md) for endpoints, WebSocket commands, examples, and deployment guidance.
@@ -685,9 +685,9 @@ pi --thinking high "Solve this complex problem"
 | `PI_SKIP_VERSION_CHECK` | Skip the Pi version update check at startup. This prevents the `pi.dev` latest-version request |
 | `PI_TELEMETRY` | Override install/update telemetry and provider attribution headers. Use `1`/`true`/`yes` to enable or `0`/`false`/`no` to disable. This does not disable update checks |
 | `PI_CACHE_RETENTION` | Set to `long` for extended prompt cache (Anthropic: 1h, OpenAI: 24h) |
-| `PI_WEB_PORT` | Web mode HTTP port (default: `3000`) |
-| `PI_WEB_HOST` | Web mode bind address (default: `127.0.0.1`) |
-| `PI_WEB_AUTH_TOKEN` | Web mode process-wide authentication token |
+| `PI_ORBIT_PORT` | Web mode HTTP port (default: `3000`) |
+| `PI_ORBIT_HOST` | Web mode bind address (default: `127.0.0.1`) |
+| `PI_ORBIT_AUTH_TOKEN` | Web mode process-wide authentication token |
 | `VISUAL`, `EDITOR` | Fallback external editor for Ctrl+G when `externalEditor` is unset; defaults to Notepad on Windows and `nano` elsewhere |
 
 Commands run by the LLM-callable bash tool also receive current session metadata:

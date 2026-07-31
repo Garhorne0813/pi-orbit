@@ -10,7 +10,15 @@ import {
 	isSetThinkingRequest,
 	isWsClientMessage,
 } from "../types.ts";
-import { RuntimeBusyError, RuntimeCapacityError, SessionInUseError, type WebSessionHost } from "../web-session-host.ts";
+import {
+	ProjectTrustRequiredError,
+	RuntimeBusyError,
+	RuntimeCapacityError,
+	RuntimeInitializationError,
+	RuntimeWorkspaceMismatchError,
+	SessionInUseError,
+	type WebSessionHost,
+} from "../web-session-host.ts";
 import type { ConnectionManager } from "../ws/connection-manager.ts";
 
 export function registerRuntimeRoutes(
@@ -45,6 +53,9 @@ export function registerRuntimeRoutes(
 			if (error instanceof RuntimeCapacityError) {
 				return context.json({ error: error.message, code: "runtime_capacity_exceeded" } as const, 429);
 			}
+			if (error instanceof ProjectTrustRequiredError) {
+				return context.json({ error: error.message, code: "project_trust_required", cwd: error.cwd }, 409);
+			}
 			if (error instanceof SessionInUseError) {
 				return context.json(
 					{
@@ -54,6 +65,27 @@ export function registerRuntimeRoutes(
 						ownerRuntimeId: error.runtimeId,
 					} as const,
 					409,
+				);
+			}
+			if (error instanceof RuntimeWorkspaceMismatchError) {
+				return context.json(
+					{
+						error: error.message,
+						code: "runtime_workspace_mismatch",
+						workspaceCwd: error.workspaceCwd,
+						sessionCwd: error.sessionCwd,
+					},
+					409,
+				);
+			}
+			if (error instanceof RuntimeInitializationError) {
+				return context.json(
+					{
+						error: error.message,
+						code: "runtime_initialization_failed",
+						diagnostics: error.diagnostics,
+					},
+					422,
 				);
 			}
 			const invalidConfiguration =
@@ -159,6 +191,17 @@ export function registerRuntimeRoutes(
 						piSessionId: error.piSessionId,
 						ownerRuntimeId: error.runtimeId,
 					} as const,
+					409,
+				);
+			}
+			if (error instanceof RuntimeWorkspaceMismatchError) {
+				return context.json(
+					{
+						error: error.message,
+						code: "runtime_workspace_mismatch",
+						workspaceCwd: error.workspaceCwd,
+						sessionCwd: error.sessionCwd,
+					},
 					409,
 				);
 			}

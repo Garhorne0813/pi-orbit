@@ -21,6 +21,7 @@ packages/ai/src/providers/.model-generation-*/
 
 # Local Web mode runtime state
 /.pi-web/
+/.pi-orbit/
 /.pi-science/
 
 # Local Web mode architecture reviews

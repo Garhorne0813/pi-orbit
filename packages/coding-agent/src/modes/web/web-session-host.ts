@@ -12,6 +12,7 @@ import type {
 	CreateSessionResponse,
 	RuntimeDescriptor,
 	SessionSummary,
+	WebProjectTrustController,
 	WebSessionEntry,
 } from "./types.ts";
 import { createWebExtensionUIContext } from "./ui-context.ts";
@@ -24,7 +25,7 @@ export type WebRuntimeFactory = (
 ) => Promise<AgentSessionRuntime>;
 export type WebSessionManagerFactory = (
 	cwd: string,
-	options?: { sessionDir?: string; sessionPath?: string },
+	options?: { sessionDir?: string; sessionPath?: string; cwdOverride?: string },
 ) => SessionManager;
 
 export interface WebSessionHostOptions {
@@ -37,6 +38,7 @@ export interface WebSessionHostOptions {
 	evictionIntervalMs?: number;
 	maxConcurrentTurns?: number;
 	disposeTimeoutMs?: number;
+	projectTrustController?: WebProjectTrustController;
 }
 
 export class RuntimeCapacityError extends Error {
@@ -65,6 +67,38 @@ export class SessionInUseError extends Error {
 	}
 }
 
+export class RuntimeWorkspaceMismatchError extends Error {
+	readonly workspaceCwd: string;
+	readonly sessionCwd: string;
+
+	constructor(workspaceCwd: string, sessionCwd: string) {
+		super("Pi session belongs to a different workspace");
+		this.name = "RuntimeWorkspaceMismatchError";
+		this.workspaceCwd = workspaceCwd;
+		this.sessionCwd = sessionCwd;
+	}
+}
+
+export class RuntimeInitializationError extends Error {
+	readonly diagnostics: readonly { type: "info" | "warning" | "error"; message: string }[];
+
+	constructor(diagnostics: readonly { type: "info" | "warning" | "error"; message: string }[]) {
+		super("Runtime initialization failed");
+		this.name = "RuntimeInitializationError";
+		this.diagnostics = diagnostics;
+	}
+}
+
+export class ProjectTrustRequiredError extends Error {
+	readonly cwd: string;
+
+	constructor(cwd: string) {
+		super("Project trust decision is required");
+		this.name = "ProjectTrustRequiredError";
+		this.cwd = cwd;
+	}
+}
+
 interface RuntimeSessionIdentity {
 	piSessionId: string;
 	sessionPath: string | null;
@@ -82,6 +116,7 @@ export class WebSessionHost {
 	private readonly evictionIntervalMs: number;
 	private readonly maxConcurrentTurns: number;
 	private readonly disposeTimeoutMs: number;
+	private readonly projectTrustController: WebProjectTrustController | undefined;
 	private readonly evictedRuntimeIds = new Set<string>();
 	private readonly activeTurnRuntimeIds = new Set<string>();
 	private readonly activeRuntimeOperations = new Map<string, "turn" | "exclusive">();
@@ -102,6 +137,7 @@ export class WebSessionHost {
 		this.evictionIntervalMs = options.evictionIntervalMs ?? Math.min(this.idleTimeoutMs, 60_000);
 		this.maxConcurrentTurns = options.maxConcurrentTurns ?? 4;
 		this.disposeTimeoutMs = options.disposeTimeoutMs ?? 10_000;
+		this.projectTrustController = options.projectTrustController;
 		if (!Number.isInteger(this.maxRuntimes) || this.maxRuntimes < 1) throw new Error("maxRuntimes must be positive");
 		if (this.idleTimeoutMs <= 0) throw new Error("idleTimeoutMs must be positive");
 		if (!Number.isInteger(this.maxConcurrentTurns) || this.maxConcurrentTurns < 1) {
@@ -150,6 +186,7 @@ export class WebSessionHost {
 		const now = Date.now();
 		this.entries.set(this.defaultRuntimeId, {
 			runtime: this.defaultRuntime,
+			workspaceCwd: this.canonicalWorkspacePath(this.defaultRuntime.cwd),
 			createdAt: now,
 			lastActivityAt: now,
 			system: true,
@@ -181,7 +218,10 @@ export class WebSessionHost {
 			runtimeId,
 			piSessionId: session.sessionId,
 			sessionPath: session.sessionFile ?? null,
+			sessionDir: session.sessionManager.isPersisted() ? session.sessionManager.getSessionDir() : null,
 			cwd: entry.runtime.cwd,
+			workspaceCwd: entry.workspaceCwd,
+			persisted: session.sessionManager.isPersisted(),
 			createdAt: entry.createdAt,
 			lastActivityAt: entry.lastActivityAt,
 			busy:
@@ -194,6 +234,7 @@ export class WebSessionHost {
 			thinking: session.thinkingLevel ?? null,
 			isStreaming: session.isStreaming,
 			isCompacting: session.isCompacting,
+			diagnostics: entry.runtime.diagnostics,
 		};
 	}
 
@@ -221,10 +262,20 @@ export class WebSessionHost {
 		const runtimeId = crypto.randomUUID();
 		let claimedIdentity: RuntimeSessionIdentity | undefined;
 		try {
+			const workspaceCwd = this.canonicalWorkspacePath(request.cwd);
+			const trustStatus = this.projectTrustController?.getStatus(workspaceCwd);
+			if (trustStatus?.required && trustStatus.decision === null) {
+				throw new ProjectTrustRequiredError(workspaceCwd);
+			}
+			if (request.cwdOverride !== undefined && this.canonicalWorkspacePath(request.cwdOverride) !== workspaceCwd) {
+				throw new RuntimeWorkspaceMismatchError(workspaceCwd, this.canonicalWorkspacePath(request.cwdOverride));
+			}
 			const sessionManager = this.createSessionManager(request.cwd, {
 				sessionDir: request.sessionDir,
 				sessionPath: request.sessionPath,
+				cwdOverride: request.cwdOverride,
 			});
+			this.assertWorkspaceMatches(workspaceCwd, sessionManager);
 			claimedIdentity = this.identityOfSessionManager(sessionManager);
 			this.claimSessionOwnership(runtimeId, claimedIdentity);
 			const runtimeEnvironment = request.runtimeEnv
@@ -232,8 +283,11 @@ export class WebSessionHost {
 						Object.entries(request.runtimeEnv).map(([key, value]) => [key, value === null ? undefined : value]),
 					)
 				: undefined;
-			const createdRuntime = await this.createRuntime(request.cwd, sessionManager, runtimeEnvironment);
+			const createdRuntime = await this.createRuntime(workspaceCwd, sessionManager, runtimeEnvironment);
 			runtime = createdRuntime;
+			if (createdRuntime.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
+				throw new RuntimeInitializationError(createdRuntime.diagnostics);
+			}
 			if (request.model !== undefined) {
 				const separator = request.model.indexOf("/");
 				if (separator <= 0 || separator === request.model.length - 1) {
@@ -252,7 +306,7 @@ export class WebSessionHost {
 				createdRuntime.session.setThinkingLevel(request.thinking);
 			}
 			const now = Date.now();
-			this.entries.set(runtimeId, { runtime: createdRuntime, createdAt: now, lastActivityAt: now });
+			this.entries.set(runtimeId, { runtime: createdRuntime, workspaceCwd, createdAt: now, lastActivityAt: now });
 			await this.connectionManager.trackSession(
 				runtimeId,
 				createdRuntime,
@@ -285,6 +339,7 @@ export class WebSessionHost {
 		let switched = false;
 		try {
 			const target = SessionManager.open(request.sessionPath, undefined, request.cwdOverride);
+			this.assertWorkspaceMatches(entry.workspaceCwd, target);
 			if (request.piSessionId !== undefined && target.getSessionId() !== request.piSessionId) {
 				throw new Error(
 					`Pi session ID mismatch: expected ${request.piSessionId}, received ${target.getSessionId()}`,
@@ -328,6 +383,7 @@ export class WebSessionHost {
 		let switched = false;
 		try {
 			const targetManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
+			this.assertWorkspaceMatches(entry.workspaceCwd, targetManager);
 			targetIdentity = this.identityOfSessionManager(targetManager);
 			this.claimSessionOwnership(runtimeId, targetIdentity);
 			const result = await entry.runtime.switchSession(sessionPath, options);
@@ -472,7 +528,11 @@ export class WebSessionHost {
 		const sessionId = crypto.randomUUID();
 		let claimedIdentity: RuntimeSessionIdentity | undefined;
 		try {
-			const cwd = request.cwd ?? process.cwd();
+			const cwd = this.canonicalWorkspacePath(request.cwd ?? process.cwd());
+			const trustStatus = this.projectTrustController?.getStatus(cwd);
+			if (trustStatus?.required && trustStatus.decision === null) {
+				throw new ProjectTrustRequiredError(cwd);
+			}
 			const sessionManager = this.createSessionManager(cwd);
 			if (request.name !== undefined) {
 				const name = request.name.trim();
@@ -484,8 +544,16 @@ export class WebSessionHost {
 
 			const createdRuntime = await this.createRuntime(cwd, sessionManager);
 			runtime = createdRuntime;
+			if (createdRuntime.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
+				throw new RuntimeInitializationError(createdRuntime.diagnostics);
+			}
 			const now = Date.now();
-			this.entries.set(sessionId, { runtime: createdRuntime, createdAt: now, lastActivityAt: now });
+			this.entries.set(sessionId, {
+				runtime: createdRuntime,
+				workspaceCwd: cwd,
+				createdAt: now,
+				lastActivityAt: now,
+			});
 			await this.connectionManager.trackSession(
 				sessionId,
 				createdRuntime,
@@ -686,6 +754,20 @@ export class WebSessionHost {
 				return absolutePath;
 			}
 		}
+	}
+
+	private canonicalWorkspacePath(cwd: string): string {
+		const absolutePath = resolve(cwd);
+		try {
+			return realpathSync(absolutePath);
+		} catch {
+			return absolutePath;
+		}
+	}
+
+	private assertWorkspaceMatches(workspaceCwd: string, sessionManager: SessionManager): void {
+		const sessionCwd = this.canonicalWorkspacePath(sessionManager.getCwd());
+		if (sessionCwd !== workspaceCwd) throw new RuntimeWorkspaceMismatchError(workspaceCwd, sessionCwd);
 	}
 
 	private claimSessionOwnership(runtimeId: string, identity: RuntimeSessionIdentity): void {
