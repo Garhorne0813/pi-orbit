@@ -150,7 +150,8 @@ RUNTIME=$(curl -fsS -X POST "$BASE_URL/api/runtimes" \
   -d '{
     "cwd":"/absolute/path/to/project",
     "sessionDir":"/absolute/path/to/pi-sessions",
-    "runtimeEnv":{"VIRTUAL_ENV":"/absolute/path/to/project/.venv"}
+    "runtimeEnv":{"VIRTUAL_ENV":"/absolute/path/to/project/.venv"},
+    "skillPolicy":{"mode":"allowlist","skills":["pdf","browser"]}
   }')
 
 RUNTIME_ID=$(printf '%s' "$RUNTIME" | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeId"])')
@@ -160,12 +161,15 @@ curl -N "$BASE_URL/api/runtimes/$RUNTIME_ID/events" -H "$AUTH_HEADER"
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | `GET` | `/api/capabilities` | 协商协议版本和宿主能力 |
-| `POST` | `/api/runtimes` | 使用 `cwd` 及可选的 `sessionDir`、`sessionPath`、`cwdOverride` 创建或打开运行时 |
+| `POST` | `/api/runtimes` | 使用 `cwd` 及可选的会话、环境、模型和 skill policy 配置创建或打开运行时 |
 | `GET` | `/api/runtimes` | 列出运行时描述符 |
 | `GET` | `/api/runtimes/:runtimeId` | 获取双 ID、路径、活动时间、模型和忙碌状态 |
 | `GET` | `/api/runtimes/:runtimeId/health` | 获取运行时健康状态和协议信息 |
 | `GET` | `/api/runtimes/:runtimeId/state` | 对账模型、思考级别、会话、队列和忙碌状态 |
 | `GET` | `/api/runtimes/:runtimeId/commands` | 列出 extension、prompt template 和 skill 命令 |
+| `GET` | `/api/runtimes/:runtimeId/skills` | 列出已发现的 skills、启用状态、诊断和 Runtime policy |
+| `PUT` | `/api/runtimes/:runtimeId/skills` | 使用 `inherit`、`none`、`allowlist` 或 `denylist` 替换 Runtime skill policy |
+| `POST` | `/api/runtimes/:runtimeId/skills/refresh` | 不重载 extensions、不重启进程，重新扫描 skill 资源 |
 | `POST` | `/api/runtimes/:runtimeId/resume` | 恢复显式 `sessionPath`，并可校验 `piSessionId` |
 | `POST` | `/api/runtimes/:runtimeId/prompt` | 提交提示，响应同时包含两个 ID |
 | `POST` | `/api/runtimes/:runtimeId/steer` | 在活动 turn 中加入 steering 输入 |
@@ -183,9 +187,9 @@ curl -N "$BASE_URL/api/runtimes/$RUNTIME_ID/events" -H "$AUTH_HEADER"
 
 创建请求支持 `provider/modelId` 格式的 `model` 和可选 `thinking`。省略 `sessionDir` 时会继承启动 Runtime 的持久化策略和会话目录。每个 Runtime 永久绑定到规范化后的 `workspaceCwd`；打开或恢复其他 workspace 的会话会返回 `runtime_workspace_mismatch`。`cwdOverride` 表示显式确认迁移，且必须与 `cwd` 解析为同一个 workspace。
 
-Runtime descriptor 除模型状态外，还包含 `workspaceCwd`、`sessionDir`、`persisted` 和资源加载 `diagnostics`。本地 extension、skill 或 prompt template 需要信任决策时，创建接口返回 `project_trust_required`；控制平面完成信任设置后重试。加载错误返回带诊断信息的 `runtime_initialization_failed`，不会注册一个部分可用的 Runtime。
+Runtime descriptor 除模型状态外，还包含 `workspaceCwd`、`sessionDir`、`persisted`、`skillPolicy` 和资源加载 `diagnostics`。本地 extension、skill 或 prompt template 需要信任决策时，创建接口返回 `project_trust_required`；控制平面完成信任设置后重试。加载错误返回带诊断信息的 `runtime_initialization_failed`，不会注册一个部分可用的 Runtime。
 
-Pi Orbit 定位为单用户共享进程运行时宿主。Provider 凭据、`agentDir`、全局 skills、extensions 和 MCP 配置属于应用级资源。`runtimeEnv` 为 Pi 管理的子进程提供 runtime 级覆盖，包括内建 bash、直接 bash 和 extension `pi.exec`，且不会修改 `process.env`；值为 `null` 时删除对应变量。服务仍会拒绝 runtime 级 `skills` 和 `extensions` 字段。直接创建子进程的第三方 extension 或 MCP adapter 必须自行合并 runtime 环境。
+Pi Orbit 定位为单用户共享进程运行时宿主。Provider 凭据、`agentDir`、skill 发现来源、extensions 和 MCP 配置属于应用级资源。每个 Runtime 可以通过 `skillPolicy` 独立过滤已发现的 skill catalog；未知或未受信任的 skill 名称会被拒绝。Policy 更新从下一轮开始生效，`skills/refresh` 用于发现进程启动后新增或删除的文件。服务仍会拒绝 runtime 级原始 `skills` 路径和 `extensions` 字段。`runtimeEnv` 为 Pi 管理的子进程提供 runtime 级覆盖且不会修改 `process.env`；值为 `null` 时删除对应变量。直接创建子进程的第三方 extension 或 MCP adapter 必须自行合并 runtime 环境。
 
 每个持久化 session path 和 `piSessionId` 只能由一个 Runtime 持有，冲突返回 HTTP 409 和 `session_in_use`。Prompt 与排他生命周期操作使用不同租约：活动 turn 中仍可调用 `steer`、`follow-up`、abort 控制和 UI response；第二个 prompt、resume、compact、fork、restart 或 delete 返回 `runtime_busy`。不同 Runtime 仍可在进程级 turn 并发限制内并行执行。
 

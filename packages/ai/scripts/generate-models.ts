@@ -580,7 +580,13 @@ function detectOpenAICompletionsCompat(model: Model<"openai-completions">): Open
 		isAntLing;
 
 	const useMaxTokens =
-		baseUrl.includes("chutes.ai") || isMoonshot || isCloudflareAiGateway || isTogether || isNvidia || isAntLing;
+		baseUrl.includes("chutes.ai") ||
+		isMoonshot ||
+		isCloudflareAiGateway ||
+		isTogether ||
+		isNvidia ||
+		isAntLing ||
+		isZai;
 
 	const isGrok = provider === "xai" || baseUrl.includes("api.x.ai");
 	const isDeepSeek = provider === "deepseek" || baseUrl.includes("deepseek.com");
@@ -807,7 +813,7 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (isGoogleThinkingApi(model) && isGemma4Model(model.id)) {
 		mergeThinkingLevelMap(model, { off: null, minimal: "MINIMAL", low: null, medium: null, high: "HIGH" });
 	}
-	if (model.provider === "groq" && model.id === "qwen/qwen3-32b") {
+	if (model.provider === "groq" && model.id === "qwen/qwen3.6-27b") {
 		mergeThinkingLevelMap(model, { minimal: null, low: null, medium: null, high: "default" });
 	}
 	if (model.provider === "openai-codex" && supportsOpenAiXhigh(model.id)) {

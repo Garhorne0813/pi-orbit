@@ -6,7 +6,12 @@
 
 import type { AgentSessionEvent } from "../../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../../core/agent-session-runtime.ts";
-import type { RuntimeEventEnvelope, WsExtensionUIRequest, WsExtensionUIResponse } from "../types.ts";
+import type {
+	RuntimeEventEnvelope,
+	RuntimeSkillsState,
+	WsExtensionUIRequest,
+	WsExtensionUIResponse,
+} from "../types.ts";
 
 /** Minimal WebSocket-like interface for sending messages */
 export interface WebSocketLike {
@@ -212,6 +217,17 @@ export class ConnectionManager {
 		const connections = this._sessions.get(sessionId);
 		if (!connections) return;
 		this.recordEvent(sessionId, connections, { type: "runtime_evicted", reason: "idle" });
+	}
+
+	publishRuntimeSkillsChanged(sessionId: string, reason: "policy" | "refresh", state: RuntimeSkillsState): void {
+		const connections = this._sessions.get(sessionId);
+		if (!connections) return;
+		this.recordEvent(sessionId, connections, {
+			type: "runtime_skills_changed",
+			reason,
+			policy: state.policy,
+			enabledSkills: state.skills.filter((skill) => skill.enabled).map((skill) => skill.name),
+		});
 	}
 
 	removeSession(sessionId: string): void {

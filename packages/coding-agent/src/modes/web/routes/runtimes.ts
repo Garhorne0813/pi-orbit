@@ -1,11 +1,13 @@
 import type { Context, Hono } from "hono";
 import { type WebCommand, WebCommandError, type WebCommandHandler } from "../commands.ts";
+import { RuntimeSkillControlUnavailableError, UnknownRuntimeSkillsError } from "../runtime-skill-policy.ts";
 import {
 	isCreateRuntimeRequest,
 	isForkRequest,
 	isPromptRequest,
 	isQueuedMessageRequest,
 	isResumeRuntimeRequest,
+	isRuntimeSkillPolicy,
 	isSetModelRequest,
 	isSetThinkingRequest,
 	isWsClientMessage,
@@ -50,6 +52,15 @@ export function registerRuntimeRoutes(
 			return context.json(await sessionHost.createHostedRuntime(body), 201);
 		} catch (error) {
 			const details = error instanceof Error ? error.message : String(error);
+			if (error instanceof UnknownRuntimeSkillsError) {
+				return context.json(
+					{ error: error.message, code: "unknown_runtime_skills", skills: error.skills } as const,
+					400,
+				);
+			}
+			if (error instanceof RuntimeSkillControlUnavailableError) {
+				return context.json({ error: error.message, code: "runtime_skill_control_unavailable" } as const, 501);
+			}
 			if (error instanceof RuntimeCapacityError) {
 				return context.json({ error: error.message, code: "runtime_capacity_exceeded" } as const, 429);
 			}
@@ -168,6 +179,38 @@ export function registerRuntimeRoutes(
 				})),
 			],
 		});
+	});
+
+	app.get("/api/runtimes/:runtimeId/skills", (context) => {
+		const runtimeId = context.req.param("runtimeId");
+		try {
+			const state = sessionHost.getRuntimeSkills(runtimeId);
+			return state ? context.json(state) : missingRuntimeResponse(context, sessionHost, runtimeId);
+		} catch (error) {
+			return runtimeSkillErrorResponse(context, error);
+		}
+	});
+
+	app.put("/api/runtimes/:runtimeId/skills", async (context) => {
+		const runtimeId = context.req.param("runtimeId");
+		const body = await readJson(context);
+		if (!isRuntimeSkillPolicy(body)) return context.json({ error: "Invalid runtime skill policy" } as const, 400);
+		try {
+			const state = await sessionHost.setRuntimeSkillPolicy(runtimeId, body);
+			return state ? context.json(state) : missingRuntimeResponse(context, sessionHost, runtimeId);
+		} catch (error) {
+			return runtimeSkillErrorResponse(context, error);
+		}
+	});
+
+	app.post("/api/runtimes/:runtimeId/skills/refresh", async (context) => {
+		const runtimeId = context.req.param("runtimeId");
+		try {
+			const state = await sessionHost.refreshRuntimeSkills(runtimeId);
+			return state ? context.json(state) : missingRuntimeResponse(context, sessionHost, runtimeId);
+		} catch (error) {
+			return runtimeSkillErrorResponse(context, error);
+		}
 	});
 
 	app.post("/api/runtimes/:runtimeId/resume", async (context) => {
@@ -313,6 +356,20 @@ async function executeRuntimeCommand(
 		}
 		return context.json({ error: "Internal server error" } as const, 500);
 	}
+}
+
+function runtimeSkillErrorResponse(context: Context, error: unknown): Response {
+	if (error instanceof RuntimeBusyError) {
+		return context.json({ error: error.message, code: "runtime_busy" } as const, 409);
+	}
+	if (error instanceof UnknownRuntimeSkillsError) {
+		return context.json({ error: error.message, code: "unknown_runtime_skills", skills: error.skills } as const, 400);
+	}
+	if (error instanceof RuntimeSkillControlUnavailableError) {
+		return context.json({ error: error.message, code: "runtime_skill_control_unavailable" } as const, 501);
+	}
+	const details = error instanceof Error ? error.message : String(error);
+	return context.json({ error: "Failed to update runtime skills", details } as const, 500);
 }
 
 function missingRuntimeResponse(context: Context, sessionHost: WebSessionHost, runtimeId: string): Response {

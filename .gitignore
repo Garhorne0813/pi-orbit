@@ -29,6 +29,7 @@ packages/ai/src/providers/.model-generation-*/
 /packages/coding-agent/docs/web-mode-multi-workspace-review-followups.md
 /packages/coding-agent/docs/web-mode-multi-workspace-remediation.md
 /packages/coding-agent/docs/web-mode-multi-workspace-remediation-review.md
+/packages/coding-agent/docs/pi-orbit-application-migration.md
 
 # Editor files
 .vscode/
@@ -53,6 +54,7 @@ out.jsonl
 pi-*.html
 out.html
 packages/coding-agent/binaries/
+/pi-orbit-darwin-arm64.tar.gz
 todo.md
 plans/
 .pi/hf-sessions/
