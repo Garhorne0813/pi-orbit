@@ -35,9 +35,13 @@ export interface ResourceLoaderReloadOptions {
 	resolveProjectTrust?: (input: { extensionsResult: LoadExtensionsResult }) => Promise<boolean>;
 }
 
+export type SkillFilter = (skills: readonly Skill[]) => Skill[];
+
 export interface ResourceLoader {
 	getExtensions(): LoadExtensionsResult;
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
+	getAvailableSkills?(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
+	setSkillFilter?(filter: SkillFilter | undefined): void;
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
 	getThemes(): { themes: Theme[]; diagnostics: ResourceDiagnostic[] };
 	getAgentsFiles(): { agentsFiles: Array<{ path: string; content: string }> };
@@ -45,6 +49,7 @@ export interface ResourceLoader {
 	getAppendSystemPrompt(): string[];
 	extendResources(paths: ResourceExtensionPaths): void;
 	reload(options?: ResourceLoaderReloadOptions): Promise<void>;
+	reloadSkills?(): Promise<void>;
 }
 
 function resolvePromptInput(input: string | undefined, description: string): string | undefined {
@@ -201,6 +206,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private extensionsResult: LoadExtensionsResult;
 	private skills: Skill[];
 	private skillDiagnostics: ResourceDiagnostic[];
+	private skillFilter: SkillFilter | undefined;
 	private prompts: PromptTemplate[];
 	private promptDiagnostics: ResourceDiagnostic[];
 	private themes: Theme[];
@@ -250,6 +256,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.extensionsResult = { extensions: [], errors: [], runtime: createExtensionRuntime() };
 		this.skills = [];
 		this.skillDiagnostics = [];
+		this.skillFilter = undefined;
 		this.prompts = [];
 		this.promptDiagnostics = [];
 		this.themes = [];
@@ -270,7 +277,18 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] } {
+		return {
+			skills: this.skillFilter ? this.skillFilter(this.skills) : this.skills,
+			diagnostics: this.skillDiagnostics,
+		};
+	}
+
+	getAvailableSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] } {
 		return { skills: this.skills, diagnostics: this.skillDiagnostics };
+	}
+
+	setSkillFilter(filter: SkillFilter | undefined): void {
+		this.skillFilter = filter;
 	}
 
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] } {
@@ -493,6 +511,43 @@ export class DefaultResourceLoader implements ResourceLoader {
 			? this.appendSystemPromptOverride(baseAppend)
 			: baseAppend;
 		this.loaded = true;
+	}
+
+	async reloadSkills(): Promise<void> {
+		await this.settingsManager.reload();
+		const resolvedPaths = await this.packageManager.resolve();
+		const cliExtensionPaths = await this.packageManager.resolveExtensionSources(this.additionalExtensionPaths, {
+			temporary: true,
+		});
+		const metadataByPath = new Map<string, PathMetadata>();
+		const enabledSkillResources = resolvedPaths.skills.filter((resource) => {
+			if (!metadataByPath.has(resource.path)) metadataByPath.set(resource.path, resource.metadata);
+			return resource.enabled;
+		});
+		for (const resource of cliExtensionPaths.skills) {
+			if (!metadataByPath.has(resource.path)) {
+				metadataByPath.set(resource.path, { source: "cli", scope: "temporary", origin: "top-level" });
+			}
+		}
+
+		const enabledSkills = enabledSkillResources.map((resource) => this.mapSkillPath(resource, metadataByPath));
+		const cliEnabledSkills = cliExtensionPaths.skills
+			.filter((resource) => resource.enabled)
+			.map((resource) => resource.path);
+		const configuredSkillPaths = this.noSkills
+			? this.mergePaths(cliEnabledSkills, this.additionalSkillPaths)
+			: this.mergePaths([...cliEnabledSkills, ...enabledSkills], this.additionalSkillPaths);
+		const skillPaths = this.mergePaths(configuredSkillPaths, [...this.extensionSkillSourceInfos.keys()]);
+
+		this.lastSkillPaths = skillPaths;
+		this.updateSkillsFromPaths(skillPaths, metadataByPath);
+		for (const path of this.additionalSkillPaths) {
+			if (!isLocalPath(path)) continue;
+			const resolved = this.resolveResourcePath(path);
+			if (!existsSync(resolved) && !this.skillDiagnostics.some((diagnostic) => diagnostic.path === resolved)) {
+				this.skillDiagnostics.push({ type: "error", message: "Skill path does not exist", path: resolved });
+			}
+		}
 	}
 
 	private async loadCurrentExtensionSet(options: { includeInlineFactories: boolean }): Promise<LoadExtensionsResult> {

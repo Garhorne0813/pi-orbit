@@ -6,11 +6,14 @@ import { isValidThinkingLevel } from "../../cli/args.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type { ReplacedSessionContext } from "../../core/extensions/index.ts";
 import { SessionManager } from "../../core/session-manager.ts";
+import { RuntimeSkillControlUnavailableError, RuntimeSkillPolicyController } from "./runtime-skill-policy.ts";
 import type {
 	CreateRuntimeRequest,
 	CreateSessionRequest,
 	CreateSessionResponse,
 	RuntimeDescriptor,
+	RuntimeSkillPolicy,
+	RuntimeSkillsState,
 	SessionSummary,
 	WebProjectTrustController,
 	WebSessionEntry,
@@ -122,6 +125,7 @@ export class WebSessionHost {
 	private readonly activeRuntimeOperations = new Map<string, "turn" | "exclusive">();
 	private readonly sessionPathOwners = new Map<string, string>();
 	private readonly piSessionOwners = new Map<string, string>();
+	private readonly runtimeSkillPolicies = new Map<string, RuntimeSkillPolicyController>();
 	private creatingRuntimes = 0;
 	private initialized = false;
 	private disposed = false;
@@ -184,6 +188,8 @@ export class WebSessionHost {
 	async initialize(): Promise<void> {
 		if (this.initialized) return;
 		const now = Date.now();
+		const skillPolicy = new RuntimeSkillPolicyController();
+		this.bindRuntimeSkillPolicy(this.defaultRuntime, skillPolicy, true);
 		this.entries.set(this.defaultRuntimeId, {
 			runtime: this.defaultRuntime,
 			workspaceCwd: this.canonicalWorkspacePath(this.defaultRuntime.cwd),
@@ -191,15 +197,17 @@ export class WebSessionHost {
 			lastActivityAt: now,
 			system: true,
 		});
+		this.runtimeSkillPolicies.set(this.defaultRuntimeId, skillPolicy);
 		this.claimSessionOwnership(this.defaultRuntimeId, this.identityOf(this.defaultRuntime));
 		try {
 			await this.connectionManager.trackSession(this.defaultRuntimeId, this.defaultRuntime, () =>
-				this.bindWebExtensions(this.defaultRuntime, this.defaultRuntimeId),
+				this.bindWebExtensions(this.defaultRuntime, this.defaultRuntimeId, skillPolicy),
 			);
 			this.initialized = true;
 			this.startEvictionTimer();
 		} catch (error) {
 			this.entries.delete(this.defaultRuntimeId);
+			this.runtimeSkillPolicies.delete(this.defaultRuntimeId);
 			this.releaseSessionOwnership(this.defaultRuntimeId, this.identityOf(this.defaultRuntime));
 			throw error;
 		}
@@ -234,6 +242,7 @@ export class WebSessionHost {
 			thinking: session.thinkingLevel ?? null,
 			isStreaming: session.isStreaming,
 			isCompacting: session.isCompacting,
+			skillPolicy: this.runtimeSkillPolicies.get(runtimeId)?.getPolicy() ?? { mode: "inherit" },
 			diagnostics: entry.runtime.diagnostics,
 		};
 	}
@@ -255,11 +264,53 @@ export class WebSessionHost {
 		});
 	}
 
+	getRuntimeSkills(runtimeId: string): RuntimeSkillsState | undefined {
+		const entry = this.entries.get(runtimeId);
+		const skillPolicy = this.runtimeSkillPolicies.get(runtimeId);
+		if (!entry || !skillPolicy) return undefined;
+		return skillPolicy.getState(entry.runtime.session.resourceLoader);
+	}
+
+	async setRuntimeSkillPolicy(runtimeId: string, policy: RuntimeSkillPolicy): Promise<RuntimeSkillsState | undefined> {
+		const entry = this.entries.get(runtimeId);
+		const skillPolicy = this.runtimeSkillPolicies.get(runtimeId);
+		if (!entry || !skillPolicy) return undefined;
+		if (!this.tryAcquireRuntimeOperation(runtimeId)) throw new RuntimeBusyError();
+		try {
+			skillPolicy.setPolicy(entry.runtime.session.resourceLoader, policy);
+			const state = skillPolicy.getState(entry.runtime.session.resourceLoader);
+			this.connectionManager.publishRuntimeSkillsChanged(runtimeId, "policy", state);
+			return state;
+		} finally {
+			this.releaseRuntimeOperation(runtimeId);
+		}
+	}
+
+	async refreshRuntimeSkills(runtimeId: string): Promise<RuntimeSkillsState | undefined> {
+		const entry = this.entries.get(runtimeId);
+		const skillPolicy = this.runtimeSkillPolicies.get(runtimeId);
+		if (!entry || !skillPolicy) return undefined;
+		if (!this.tryAcquireRuntimeOperation(runtimeId)) throw new RuntimeBusyError();
+		try {
+			const resourceLoader = entry.runtime.session.resourceLoader;
+			if (!resourceLoader.reloadSkills) throw new RuntimeSkillControlUnavailableError();
+			await resourceLoader.reloadSkills();
+			skillPolicy.bind(resourceLoader);
+			skillPolicy.reconcile(resourceLoader);
+			const state = skillPolicy.getState(resourceLoader);
+			this.connectionManager.publishRuntimeSkillsChanged(runtimeId, "refresh", state);
+			return state;
+		} finally {
+			this.releaseRuntimeOperation(runtimeId);
+		}
+	}
+
 	async createHostedRuntime(request: CreateRuntimeRequest): Promise<RuntimeDescriptor> {
 		if (this.disposed) throw new Error("Web session host is disposed");
 		await this.acquireRuntimeSlot();
 		let runtime: AgentSessionRuntime | undefined;
 		const runtimeId = crypto.randomUUID();
+		const skillPolicy = new RuntimeSkillPolicyController(request.skillPolicy);
 		let claimedIdentity: RuntimeSessionIdentity | undefined;
 		try {
 			const workspaceCwd = this.canonicalWorkspacePath(request.cwd);
@@ -288,6 +339,7 @@ export class WebSessionHost {
 			if (createdRuntime.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
 				throw new RuntimeInitializationError(createdRuntime.diagnostics);
 			}
+			this.bindRuntimeSkillPolicy(createdRuntime, skillPolicy, true);
 			if (request.model !== undefined) {
 				const separator = request.model.indexOf("/");
 				if (separator <= 0 || separator === request.model.length - 1) {
@@ -307,10 +359,11 @@ export class WebSessionHost {
 			}
 			const now = Date.now();
 			this.entries.set(runtimeId, { runtime: createdRuntime, workspaceCwd, createdAt: now, lastActivityAt: now });
+			this.runtimeSkillPolicies.set(runtimeId, skillPolicy);
 			await this.connectionManager.trackSession(
 				runtimeId,
 				createdRuntime,
-				() => this.bindWebExtensions(createdRuntime, runtimeId),
+				() => this.bindWebExtensions(createdRuntime, runtimeId, skillPolicy),
 				() => this.markActivity(runtimeId),
 			);
 			const descriptor = this.describe(runtimeId);
@@ -318,6 +371,7 @@ export class WebSessionHost {
 			return descriptor;
 		} catch (error) {
 			this.entries.delete(runtimeId);
+			this.runtimeSkillPolicies.delete(runtimeId);
 			this.connectionManager.removeSession(runtimeId);
 			if (claimedIdentity) this.releaseSessionOwnership(runtimeId, claimedIdentity);
 			if (runtime) await this.disposeRuntime(runtimeId, runtime);
@@ -526,6 +580,7 @@ export class WebSessionHost {
 		await this.acquireRuntimeSlot();
 		let runtime: AgentSessionRuntime | undefined;
 		const sessionId = crypto.randomUUID();
+		const skillPolicy = new RuntimeSkillPolicyController();
 		let claimedIdentity: RuntimeSessionIdentity | undefined;
 		try {
 			const cwd = this.canonicalWorkspacePath(request.cwd ?? process.cwd());
@@ -547,6 +602,7 @@ export class WebSessionHost {
 			if (createdRuntime.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
 				throw new RuntimeInitializationError(createdRuntime.diagnostics);
 			}
+			this.bindRuntimeSkillPolicy(createdRuntime, skillPolicy, true);
 			const now = Date.now();
 			this.entries.set(sessionId, {
 				runtime: createdRuntime,
@@ -554,15 +610,17 @@ export class WebSessionHost {
 				createdAt: now,
 				lastActivityAt: now,
 			});
+			this.runtimeSkillPolicies.set(sessionId, skillPolicy);
 			await this.connectionManager.trackSession(
 				sessionId,
 				createdRuntime,
-				() => this.bindWebExtensions(createdRuntime, sessionId),
+				() => this.bindWebExtensions(createdRuntime, sessionId, skillPolicy),
 				() => this.markActivity(sessionId),
 			);
 			return { sessionId };
 		} catch (error) {
 			this.entries.delete(sessionId);
+			this.runtimeSkillPolicies.delete(sessionId);
 			this.connectionManager.removeSession(sessionId);
 			if (claimedIdentity) this.releaseSessionOwnership(sessionId, claimedIdentity);
 			if (runtime) await this.disposeRuntime(sessionId, runtime);
@@ -612,6 +670,7 @@ export class WebSessionHost {
 		if (!this.tryAcquireRuntimeOperation(sessionId)) return "busy";
 
 		this.entries.delete(sessionId);
+		this.runtimeSkillPolicies.delete(sessionId);
 		this.releaseSessionOwnership(sessionId, this.identityOf(entry.runtime));
 		this.activeRuntimeOperations.delete(sessionId);
 		this.releaseAgentTurn(sessionId);
@@ -623,6 +682,7 @@ export class WebSessionHost {
 	async restartSession(sessionId: string): Promise<"restarted" | "busy" | "not_found"> {
 		const entry = this.entries.get(sessionId);
 		if (!entry) return "not_found";
+		const skillPolicy = this.runtimeSkillPolicies.get(sessionId) ?? new RuntimeSkillPolicyController();
 		if (!this.tryAcquireRuntimeOperation(sessionId)) return "busy";
 
 		try {
@@ -639,10 +699,11 @@ export class WebSessionHost {
 					entry.runtime.services.environment,
 				);
 				replacement = createdReplacement;
+				this.bindRuntimeSkillPolicy(createdReplacement, skillPolicy, false);
 				await this.connectionManager.replaceSession(
 					sessionId,
 					createdReplacement,
-					() => this.bindWebExtensions(createdReplacement, sessionId),
+					() => this.bindWebExtensions(createdReplacement, sessionId, skillPolicy),
 					() => this.markActivity(sessionId),
 				);
 
@@ -666,6 +727,7 @@ export class WebSessionHost {
 		if (this.evictionTimer) clearInterval(this.evictionTimer);
 		const entries = [...this.entries];
 		this.entries.clear();
+		this.runtimeSkillPolicies.clear();
 		for (const [sessionId, entry] of entries) {
 			this.releaseSessionOwnership(sessionId, this.identityOf(entry.runtime));
 			this.connectionManager.removeSession(sessionId);
@@ -705,7 +767,12 @@ export class WebSessionHost {
 		this.evictionTimer.unref();
 	}
 
-	private bindWebExtensions(runtime: AgentSessionRuntime, sessionId: string): Promise<void> {
+	private bindWebExtensions(
+		runtime: AgentSessionRuntime,
+		sessionId: string,
+		skillPolicy: RuntimeSkillPolicyController,
+	): Promise<void> {
+		this.bindRuntimeSkillPolicy(runtime, skillPolicy, false);
 		return runtime.session.bindExtensions({
 			uiContext: createWebExtensionUIContext(sessionId, this.connectionManager),
 			mode: "web",
@@ -729,6 +796,17 @@ export class WebSessionHost {
 				console.error(`[web] Session ${sessionId} extension error:`, error.error);
 			},
 		});
+	}
+
+	private bindRuntimeSkillPolicy(
+		runtime: AgentSessionRuntime,
+		skillPolicy: RuntimeSkillPolicyController,
+		validate: boolean,
+	): void {
+		const resourceLoader = runtime.session.resourceLoader;
+		skillPolicy.bind(resourceLoader);
+		if (validate) skillPolicy.assertKnownSkills(resourceLoader);
+		else skillPolicy.reconcile(resourceLoader);
 	}
 
 	private identityOf(runtime: AgentSessionRuntime): RuntimeSessionIdentity {

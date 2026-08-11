@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { copyFileSync, existsSync, mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
@@ -40,10 +40,19 @@ describe("web mode server", () => {
 			requestBodyLimitBytes?: number;
 			projectTrustRequired?: boolean;
 			runtimeInitializationError?: string;
+			skillNames?: string[];
 		} = {},
 	) {
 		const root = join(tmpdir(), `pi-web-server-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(root, { recursive: true });
+		for (const skillName of options.skillNames ?? []) {
+			const skillDir = join(root, "skills", skillName);
+			mkdirSync(skillDir, { recursive: true });
+			writeFileSync(
+				join(skillDir, "SKILL.md"),
+				`---\nname: ${skillName}\ndescription: ${skillName} test skill\n---\n\nUse ${skillName}.\n`,
+			);
+		}
 		const faux = registerFauxProvider({ models: [{ id: "faux-1", reasoning: true }] });
 		faux.setResponses([fauxAssistantMessage("websocket response"), fauxAssistantMessage("http response")]);
 		const authStorage = AuthStorage.inMemory();
@@ -86,7 +95,7 @@ describe("web mode server", () => {
 				modelRuntime,
 				resourceLoaderOptions: {
 					noExtensions: true,
-					noSkills: true,
+					noSkills: options.skillNames === undefined,
 					noPromptTemplates: true,
 					noThemes: true,
 				},
@@ -211,6 +220,8 @@ describe("web mode server", () => {
 				runtimeOperationLeases: true,
 				qualifiedModelIdentity: true,
 				runtimeEnvironment: true,
+				runtimeSkillOverrides: true,
+				runtimeSkillRefresh: true,
 			},
 		});
 
@@ -620,6 +631,133 @@ describe("web mode server", () => {
 		}
 	});
 
+	it("controls discovered skills independently for runtimes in one process", async () => {
+		const { baseUrl, connectionManager, root } = await createHarness({ skillNames: ["alpha", "beta"] });
+		const createRuntime = async (skillPolicy: Record<string, unknown>) => {
+			const response = await fetch(`${baseUrl}/api/runtimes`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					cwd: root,
+					sessionDir: join(root, `skill-sessions-${Math.random().toString(36).slice(2)}`),
+					skillPolicy,
+				}),
+			});
+			expect(response.status).toBe(201);
+			return ((await response.json()) as { runtimeId: string }).runtimeId;
+		};
+		const allowlistRuntimeId = await createRuntime({ mode: "allowlist", skills: ["alpha"] });
+		const disabledRuntimeId = await createRuntime({ mode: "none" });
+
+		const allowlistState = await fetch(`${baseUrl}/api/runtimes/${allowlistRuntimeId}/skills`);
+		const allowlistBody = (await allowlistState.json()) as {
+			policy: Record<string, unknown>;
+			skills: Array<{ name: string; enabled: boolean }>;
+		};
+		expect(allowlistBody.policy).toEqual({ mode: "allowlist", skills: ["alpha"] });
+		expect(allowlistBody.skills).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ name: "alpha", enabled: true }),
+				expect.objectContaining({ name: "beta", enabled: false }),
+			]),
+		);
+		const commands = await fetch(`${baseUrl}/api/runtimes/${allowlistRuntimeId}/commands`);
+		expect(await commands.json()).toMatchObject({ commands: [{ name: "skill:alpha", source: "skill" }] });
+		const disabledBody = (await (await fetch(`${baseUrl}/api/runtimes/${disabledRuntimeId}/skills`)).json()) as {
+			policy: Record<string, unknown>;
+			skills: Array<{ name: string; enabled: boolean }>;
+		};
+		expect(disabledBody.policy).toEqual({ mode: "none" });
+		expect(disabledBody.skills).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ name: "alpha", enabled: false }),
+				expect.objectContaining({ name: "beta", enabled: false }),
+			]),
+		);
+
+		const updated = await fetch(`${baseUrl}/api/runtimes/${allowlistRuntimeId}/skills`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ mode: "denylist", skills: ["alpha"] }),
+		});
+		expect(updated.status).toBe(200);
+		const updatedBody = (await updated.json()) as {
+			policy: Record<string, unknown>;
+			skills: Array<{ name: string; enabled: boolean }>;
+		};
+		expect(updatedBody.policy).toEqual({ mode: "denylist", skills: ["alpha"] });
+		expect(updatedBody.skills).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ name: "alpha", enabled: false }),
+				expect.objectContaining({ name: "beta", enabled: true }),
+			]),
+		);
+		expect(
+			connectionManager
+				.getBufferedEvents(allowlistRuntimeId)
+				.some((event) => event.event.type === "runtime_skills_changed"),
+		).toBe(true);
+		expect(await (await fetch(`${baseUrl}/api/runtimes/${disabledRuntimeId}/skills`)).json()).toMatchObject({
+			policy: { mode: "none" },
+		});
+
+		const unknown = await fetch(`${baseUrl}/api/runtimes/${allowlistRuntimeId}/skills`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ mode: "allowlist", skills: ["missing"] }),
+		});
+		expect(unknown.status).toBe(400);
+		expect(await unknown.json()).toMatchObject({ code: "unknown_runtime_skills", skills: ["missing"] });
+	});
+
+	it("refreshes skills without restarting the process and reconciles removed skills", async () => {
+		const { baseUrl, root } = await createHarness({ skillNames: ["alpha"] });
+		const created = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				cwd: root,
+				sessionDir: join(root, "refresh-sessions"),
+				skillPolicy: { mode: "allowlist", skills: ["alpha"] },
+			}),
+		});
+		const { runtimeId } = (await created.json()) as { runtimeId: string };
+		const gammaDir = join(root, "skills", "gamma");
+		mkdirSync(gammaDir, { recursive: true });
+		writeFileSync(join(gammaDir, "SKILL.md"), "---\nname: gamma\ndescription: gamma test skill\n---\n\nUse gamma.\n");
+		rmSync(join(root, "skills", "alpha"), { recursive: true, force: true });
+
+		const refreshed = await fetch(`${baseUrl}/api/runtimes/${runtimeId}/skills/refresh`, { method: "POST" });
+		expect(refreshed.status).toBe(200);
+		const refreshedBody = (await refreshed.json()) as {
+			policy: Record<string, unknown>;
+			skills: Array<{ name: string; enabled: boolean }>;
+		};
+		expect(refreshedBody.policy).toEqual({ mode: "allowlist", skills: [] });
+		expect(refreshedBody.skills).toContainEqual(expect.objectContaining({ name: "gamma", enabled: false }));
+		expect(refreshedBody.skills.some((skill) => skill.name === "alpha")).toBe(false);
+
+		const inherited = await fetch(`${baseUrl}/api/runtimes/${runtimeId}/skills`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ mode: "inherit" }),
+		});
+		const inheritedBody = (await inherited.json()) as { skills: Array<{ name: string; enabled: boolean }> };
+		expect(inheritedBody.skills).toContainEqual(expect.objectContaining({ name: "gamma", enabled: true }));
+	});
+
+	it("rejects unknown skills during runtime creation", async () => {
+		const { baseUrl, root } = await createHarness({ skillNames: ["alpha"] });
+		const response = await fetch(`${baseUrl}/api/runtimes`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ cwd: root, skillPolicy: { mode: "allowlist", skills: ["missing"] } }),
+		});
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({ code: "unknown_runtime_skills", skills: ["missing"] });
+	});
+
 	it("streams events through the maintained WebSocket adapter after accepting a command", async () => {
 		const { wsUrl, sessionHost } = await createHarness();
 		const websocket = new WebSocket(`${wsUrl}/ws?session_id=${sessionHost.defaultSessionId}`);
@@ -1020,10 +1158,16 @@ describe("web mode server", () => {
 	});
 
 	it("restarts the protected default session without changing its web session id", async () => {
-		const { baseUrl, sessionHost, connectionManager } = await createHarness();
+		const { baseUrl, sessionHost, connectionManager } = await createHarness({ skillNames: ["alpha"] });
 		const sessionId = sessionHost.defaultSessionId;
 		const previousRuntime = sessionHost.get(sessionId)?.runtime;
 		if (!previousRuntime) throw new Error("missing default runtime");
+		const skillPolicy = await fetch(`${baseUrl}/api/runtimes/${sessionId}/skills`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ mode: "none" }),
+		});
+		expect(skillPolicy.status).toBe(200);
 		await previousRuntime.session.prompt("before restart");
 		const previousSequence = connectionManager.getReplayWindow(sessionId, Number.MAX_SAFE_INTEGER).latestSequence;
 
@@ -1031,6 +1175,9 @@ describe("web mode server", () => {
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({ success: true });
 		expect(sessionHost.get(sessionId)?.runtime).not.toBe(previousRuntime);
+		expect(await (await fetch(`${baseUrl}/api/runtimes/${sessionId}/skills`)).json()).toMatchObject({
+			policy: { mode: "none" },
+		});
 		await sessionHost.get(sessionId)?.runtime.session.prompt("after restart");
 		const events = connectionManager.getBufferedEvents(sessionId, previousSequence);
 		expect(events.length).toBeGreaterThan(0);
@@ -1149,6 +1296,13 @@ describe("web mode server", () => {
 		const rejected = await prompt();
 		expect(rejected.status).toBe(409);
 		expect(await rejected.json()).toMatchObject({ code: "runtime_busy" });
+		const skillUpdate = await fetch(`${baseUrl}/api/runtimes/${runtimeId}/skills`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ mode: "none" }),
+		});
+		expect(skillUpdate.status).toBe(409);
+		expect(await skillUpdate.json()).toMatchObject({ code: "runtime_busy" });
 		finishTurn();
 	});
 

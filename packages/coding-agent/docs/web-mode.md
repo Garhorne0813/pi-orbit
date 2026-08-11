@@ -90,6 +90,10 @@ Create a runtime:
   "cwdOverride": "/workspace/project",
   "model": "anthropic/claude-sonnet-5",
   "thinking": "high",
+  "skillPolicy": {
+    "mode": "allowlist",
+    "skills": ["pdf", "browser"]
+  },
   "runtimeEnv": {
     "VIRTUAL_ENV": "/workspace/project/.venv",
     "PATH": "/workspace/project/.venv/bin:/usr/bin",
@@ -98,9 +102,9 @@ Create a runtime:
 }
 ```
 
-`sessionDir`, `sessionPath`, `cwdOverride`, `model`, `thinking`, and `runtimeEnv` are optional. Omitting `sessionDir` inherits the startup runtime's persistence policy and session directory. `cwdOverride` is only for explicitly relocating an existing session and must resolve to the same canonical path as `cwd`.
+`sessionDir`, `sessionPath`, `cwdOverride`, `model`, `thinking`, `skillPolicy`, and `runtimeEnv` are optional. Omitting `sessionDir` inherits the startup runtime's persistence policy and session directory. `cwdOverride` is only for explicitly relocating an existing session and must resolve to the same canonical path as `cwd`.
 
-The canonical workspace is immutable for the lifetime of a runtime. Create, resume, and legacy switch operations reject a session recorded for another workspace with `runtime_workspace_mismatch`. A string in `runtimeEnv` overrides the inherited child-process value; `null` removes it. The environment is stored on the runtime and is used by built-in bash tools, direct bash commands, and extension `pi.exec` calls without mutating `process.env`. Provider credentials, `agentDir`, skills, extensions, and MCP configuration remain application-level resources; requests containing runtime-scoped `skills` or `extensions` are invalid. An MCP or third-party extension that starts processes directly must explicitly consume the runtime execution environment contract; Pi Orbit cannot intercept arbitrary `child_process.spawn` calls.
+The canonical workspace is immutable for the lifetime of a runtime. Create, resume, and legacy switch operations reject a session recorded for another workspace with `runtime_workspace_mismatch`. A string in `runtimeEnv` overrides the inherited child-process value; `null` removes it. The environment is stored on the runtime and is used by built-in bash tools, direct bash commands, and extension `pi.exec` calls without mutating `process.env`. Provider credentials, `agentDir`, skill discovery sources, extensions, and MCP configuration remain application-level resources. Each runtime can independently filter discovered skills with `skillPolicy`; raw runtime-scoped skill paths and extensions remain invalid. An MCP or third-party extension that starts processes directly must explicitly consume the runtime execution environment contract; Pi Orbit cannot intercept arbitrary `child_process.spawn` calls.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -109,6 +113,9 @@ The canonical workspace is immutable for the lifetime of a runtime. Create, resu
 | `GET` | `/api/runtimes/:runtimeId` | Read identity, path, model, activity, and busy state. |
 | `GET` | `/api/runtimes/:runtimeId/state` | Reconcile model, thinking, session, queue, and busy state. |
 | `GET` | `/api/runtimes/:runtimeId/commands` | List extension, prompt-template, and skill commands. |
+| `GET` | `/api/runtimes/:runtimeId/skills` | List discovered skills, enabled state, diagnostics, and the current policy. |
+| `PUT` | `/api/runtimes/:runtimeId/skills` | Replace the runtime policy with `inherit`, `none`, `allowlist`, or `denylist`. |
+| `POST` | `/api/runtimes/:runtimeId/skills/refresh` | Rescan skill resources without reloading extensions. |
 | `DELETE` | `/api/runtimes/:runtimeId` | Dispose a dynamic runtime without deleting session storage. |
 | `POST` | `/api/runtimes/:runtimeId/resume` | Resume `{ sessionPath, piSessionId?, cwdOverride? }`; an identity mismatch returns HTTP 409. |
 | `POST` | `/api/runtimes/:runtimeId/prompt` | Submit `{ message }`; returns HTTP 202 with both IDs. |

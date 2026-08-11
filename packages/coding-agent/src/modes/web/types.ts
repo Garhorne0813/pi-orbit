@@ -1,6 +1,8 @@
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionEvent } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
+import type { ResourceDiagnostic } from "../../core/diagnostics.ts";
+import type { SourceInfo } from "../../core/source-info.ts";
 
 /**
  * Types for the web mode REST API and WebSocket protocol.
@@ -58,7 +60,36 @@ export interface RuntimeDescriptor {
 	thinking: string | null;
 	isStreaming: boolean;
 	isCompacting: boolean;
+	skillPolicy: RuntimeSkillPolicy;
 	diagnostics: readonly { type: "info" | "warning" | "error"; message: string }[];
+}
+
+export type RuntimeSkillPolicy =
+	| { mode: "inherit" }
+	| { mode: "none" }
+	| { mode: "allowlist"; skills: string[] }
+	| { mode: "denylist"; skills: string[] };
+
+export interface RuntimeSkillDescriptor {
+	name: string;
+	description: string;
+	filePath: string;
+	sourceInfo: SourceInfo;
+	disableModelInvocation: boolean;
+	enabled: boolean;
+}
+
+export interface RuntimeSkillsState {
+	policy: RuntimeSkillPolicy;
+	skills: RuntimeSkillDescriptor[];
+	diagnostics: ResourceDiagnostic[];
+}
+
+export interface RuntimeSkillsChangedEvent {
+	type: "runtime_skills_changed";
+	reason: "policy" | "refresh";
+	policy: RuntimeSkillPolicy;
+	enabledSkills: string[];
 }
 
 export interface CreateRuntimeRequest {
@@ -70,6 +101,7 @@ export interface CreateRuntimeRequest {
 	model?: string;
 	thinking?: string;
 	runtimeEnv?: Record<string, string | null>;
+	skillPolicy?: RuntimeSkillPolicy;
 }
 
 export interface ProjectTrustStatus {
@@ -123,6 +155,8 @@ export interface RuntimeCapabilities {
 		commandCatalog: true;
 		runtimeEnvironment: true;
 		runtimeResourceOverrides: false;
+		runtimeSkillOverrides: true;
+		runtimeSkillRefresh: true;
 		browserSessionAuth: true;
 		workspaceBinding: true;
 		projectTrustApi: true;
@@ -149,6 +183,8 @@ export const RUNTIME_CAPABILITIES: Omit<RuntimeCapabilities, "piVersion"> = {
 		commandCatalog: true,
 		runtimeEnvironment: true,
 		runtimeResourceOverrides: false,
+		runtimeSkillOverrides: true,
+		runtimeSkillRefresh: true,
 		browserSessionAuth: true,
 		workspaceBinding: true,
 		projectTrustApi: true,
@@ -163,7 +199,11 @@ export interface RuntimeEventEnvelope {
 	piSessionId: string;
 	sequence: number;
 	timestamp: string;
-	event: AgentSessionEvent | WsExtensionUIRequest | { type: "runtime_evicted"; reason: "idle" };
+	event:
+		| AgentSessionEvent
+		| WsExtensionUIRequest
+		| RuntimeSkillsChangedEvent
+		| { type: "runtime_evicted"; reason: "idle" };
 }
 
 /** Create session request body */
@@ -342,7 +382,20 @@ export function isCreateRuntimeRequest(data: unknown): data is CreateRuntimeRequ
 	if (object.model !== undefined && !hasNonEmptyString(object, "model")) return false;
 	if (object.thinking !== undefined && !hasNonEmptyString(object, "thinking")) return false;
 	if (object.runtimeEnv !== undefined && !isRuntimeEnvironment(object.runtimeEnv)) return false;
+	if (object.skillPolicy !== undefined && !isRuntimeSkillPolicy(object.skillPolicy)) return false;
 	return object.skills === undefined && object.extensions === undefined;
+}
+
+export function isRuntimeSkillPolicy(data: unknown): data is RuntimeSkillPolicy {
+	if (typeof data !== "object" || data === null || Array.isArray(data)) return false;
+	const object = data as Record<string, unknown>;
+	if (object.mode === "inherit" || object.mode === "none") return object.skills === undefined;
+	if (object.mode !== "allowlist" && object.mode !== "denylist") return false;
+	return (
+		Array.isArray(object.skills) &&
+		object.skills.every((skill) => typeof skill === "string" && skill.length > 0) &&
+		new Set(object.skills).size === object.skills.length
+	);
 }
 
 export function isSetProjectTrustRequest(data: unknown): data is SetProjectTrustRequest {

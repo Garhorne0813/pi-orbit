@@ -150,7 +150,8 @@ RUNTIME=$(curl -fsS -X POST "$BASE_URL/api/runtimes" \
   -d '{
     "cwd":"/absolute/path/to/project",
     "sessionDir":"/absolute/path/to/pi-sessions",
-    "runtimeEnv":{"VIRTUAL_ENV":"/absolute/path/to/project/.venv"}
+    "runtimeEnv":{"VIRTUAL_ENV":"/absolute/path/to/project/.venv"},
+    "skillPolicy":{"mode":"allowlist","skills":["pdf","browser"]}
   }')
 
 RUNTIME_ID=$(printf '%s' "$RUNTIME" | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeId"])')
@@ -160,12 +161,15 @@ curl -N "$BASE_URL/api/runtimes/$RUNTIME_ID/events" -H "$AUTH_HEADER"
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/capabilities` | Negotiate protocol version and runtime-host features |
-| `POST` | `/api/runtimes` | Create or open a runtime with `cwd` and optional `sessionDir`, `sessionPath`, and `cwdOverride` |
+| `POST` | `/api/runtimes` | Create or open a runtime with `cwd` and optional session, environment, model, and skill policy settings |
 | `GET` | `/api/runtimes` | List runtime descriptors |
 | `GET` | `/api/runtimes/:runtimeId` | Read both identities, paths, activity, model, and busy state |
 | `GET` | `/api/runtimes/:runtimeId/health` | Read runtime-specific health and protocol information |
 | `GET` | `/api/runtimes/:runtimeId/state` | Reconcile model, thinking, session, queue, and busy state |
 | `GET` | `/api/runtimes/:runtimeId/commands` | List extension, prompt-template, and skill commands |
+| `GET` | `/api/runtimes/:runtimeId/skills` | List discovered skills, enabled state, diagnostics, and the runtime policy |
+| `PUT` | `/api/runtimes/:runtimeId/skills` | Replace the runtime skill policy with `inherit`, `none`, `allowlist`, or `denylist` |
+| `POST` | `/api/runtimes/:runtimeId/skills/refresh` | Rescan skill resources without reloading extensions or restarting the process |
 | `POST` | `/api/runtimes/:runtimeId/resume` | Resume an explicit `sessionPath`, optionally checking `piSessionId` |
 | `POST` | `/api/runtimes/:runtimeId/prompt` | Submit a prompt; responses include both identities |
 | `POST` | `/api/runtimes/:runtimeId/steer` | Queue steering input during an active turn |
@@ -183,9 +187,9 @@ curl -N "$BASE_URL/api/runtimes/$RUNTIME_ID/events" -H "$AUTH_HEADER"
 
 Creation accepts `model` in `provider/modelId` form and an optional `thinking` level. Omitting `sessionDir` inherits the startup runtime's persistence policy and session directory. A runtime is permanently bound to the canonical `workspaceCwd`; opening or resuming a session from another workspace returns `runtime_workspace_mismatch`. `cwdOverride` is an explicit relocation acknowledgement and must resolve to the same workspace as `cwd`.
 
-Runtime descriptors expose `workspaceCwd`, `sessionDir`, `persisted`, and resource-loader `diagnostics` in addition to model state. When local extensions, skills, or prompt templates require a trust decision, creation returns `project_trust_required`; use the project-trust API and retry. Loader errors return `runtime_initialization_failed` with diagnostics instead of leaving a partially usable runtime registered.
+Runtime descriptors expose `workspaceCwd`, `sessionDir`, `persisted`, `skillPolicy`, and resource-loader `diagnostics` in addition to model state. When local extensions, skills, or prompt templates require a trust decision, creation returns `project_trust_required`; use the project-trust API and retry. Loader errors return `runtime_initialization_failed` with diagnostics instead of leaving a partially usable runtime registered.
 
-Pi Orbit is a single-user, shared-process runtime host. Provider credentials, `agentDir`, global skills, extensions, and MCP configuration are application-level resources. `runtimeEnv` supplies per-runtime overrides for Pi-managed child processes, including built-in bash, direct bash, and extension `pi.exec`, without changing `process.env`; `null` removes a variable. Runtime-scoped `skills` and `extensions` fields are rejected. Third-party extensions and MCP adapters that spawn processes directly must merge the runtime environment themselves.
+Pi Orbit is a single-user, shared-process runtime host. Provider credentials, `agentDir`, discovered skill sources, extensions, and MCP configuration are application-level resources. Each runtime may independently filter the discovered skill catalog with `skillPolicy`; unknown or untrusted skill names are rejected. Policy changes take effect on the next turn, while `skills/refresh` discovers files added or removed after process startup. Raw runtime-scoped `skills` paths and `extensions` remain invalid. `runtimeEnv` supplies per-runtime overrides for Pi-managed child processes without changing `process.env`; `null` removes a variable. Third-party extensions and MCP adapters that spawn processes directly must merge the runtime environment themselves.
 
 Each persisted session path and `piSessionId` has one runtime owner. Conflicts return HTTP 409 with `session_in_use`. Prompt and exclusive lifecycle operations use separate leases: `steer`, `follow-up`, abort controls, and UI responses remain available during an active turn, while a second prompt, resume, compact, fork, restart, or delete returns `runtime_busy`. Different runtimes can still execute concurrently within the process-wide turn limit.
 
