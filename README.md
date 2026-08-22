@@ -310,11 +310,16 @@ Session isolation is logical, not an operating-system security boundary. Session
 ## Packages
 
 | Package | Description |
-|---|---|
-| [@earendil-works/pi-ai](packages/ai) | Unified multi-provider LLM API |
-| [@earendil-works/pi-agent-core](packages/agent) | Agent loop, tool calling, events, and state management |
-| [@earendil-works/pi-coding-agent](packages/coding-agent) | CLI, sessions, tools, extensions, RPC, and Web mode |
-| [@earendil-works/pi-tui](packages/tui) | Differential-rendering terminal UI library |
+|---------|-------------|
+| **[@earendil-works/pi-telemetry](packages/telemetry)** | Vendor-neutral telemetry contracts, reference adapter, conformance tests, and typed schemas |
+| **[@earendil-works/pi-ai](packages/ai)** | Unified multi-provider LLM API (OpenAI, Anthropic, Google, etc.) |
+| **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
+| **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI with RPC and Web mode |
+| **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
+| **[@earendil-works/pi-protocol](packages/protocol)** | Shared protocol schemas and framing |
+| **[@earendil-works/pi-client](packages/client)** | Client library for remote Pi sessions |
+| **[@earendil-works/pi-server](packages/server)** | Session server and transport implementations |
+| **[@earendil-works/pi-session-backend-sqlite-node](packages/session-backends/sqlite-node)** | SQLite session storage backend |
 
 The coding-agent package also exposes an SDK for applications that want to embed Pi without running a transport server. See [SDK documentation](packages/coding-agent/docs/sdk.md).
 
