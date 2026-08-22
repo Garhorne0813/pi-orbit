@@ -129,6 +129,7 @@ For each built-in provider, pi maintains a list of tool-capable models. Configur
 - Hugging Face
 - Fireworks
 - Together AI
+- Baseten
 - Kimi For Coding
 - MiniMax
 - Xiaomi MiMo
@@ -323,6 +324,8 @@ Pi loads `AGENTS.md` (or `CLAUDE.md`) at startup from:
 - `~/.pi/agent/AGENTS.md` (global)
 - Parent directories (walking up from cwd)
 - Current directory
+
+If a directory contains `AGENTS.override.md`, Pi loads it instead of `AGENTS.md` or `CLAUDE.md` from that directory. Context files from other directories are still concatenated.
 
 Use for project instructions (`AGENTS.md`/`CLAUDE.md`), conventions, common commands. All matching files are concatenated.
 
@@ -617,6 +620,8 @@ Combine `--no-*` with explicit flags to load exactly what you need, ignoring set
 |--------|-------------|
 | `--system-prompt <text>` | Replace default prompt (context files and skills still appended) |
 | `--append-system-prompt <text>` | Append to system prompt |
+| `--tui-mode <mode>` | TUI mode: `regular` (default) or experimental `fullscreen` |
+| `--use-theme <name[/name]>` | Set the initial interactive theme for this run without changing settings |
 | `--verbose` | Force verbose startup |
 | `--port <port>` | Web mode HTTP port (default: `3000`) |
 | `--host <host>` | Web mode bind address (default: `127.0.0.1`) |
@@ -677,6 +682,7 @@ pi --thinking high "Solve this complex problem"
 
 | Variable | Description |
 |----------|-------------|
+| `AI_AGENT` | Set to `pi` by the CLI and RPC entry points so generic tooling can attribute child processes to Pi |
 | `PI_CODING_AGENT` | Set to `true` by the CLI and RPC entry points so child processes can detect that they run inside Pi |
 | `PI_CODING_AGENT_DIR` | Override config directory (default: `~/.pi/agent`) |
 | `PI_CODING_AGENT_SESSION_DIR` | Override session storage directory (overridden by `--session-dir`) |
