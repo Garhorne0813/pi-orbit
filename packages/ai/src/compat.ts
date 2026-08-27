@@ -236,7 +236,14 @@ function hasResolvedCloudflareAuth(options: StreamOptions | undefined): boolean 
 function getBuiltinProviderForModel(model: Model<Api>) {
 	if (getApiProvider(model.api) !== builtinApiProviderInstances.get(model.api)) return undefined;
 	const provider = compatModels.getProvider(model.provider);
-	return provider?.getModels().some((candidate) => candidate.api === model.api) ? provider : undefined;
+	if (!provider) return undefined;
+
+	// Cloudflare Gateway also accepts user-defined /compat models. The generated
+	// catalog can omit that API group even though the provider still supports it.
+	return provider.getModels().some((candidate) => candidate.api === model.api) ||
+		(model.provider === "cloudflare-ai-gateway" && model.api === "openai-completions")
+		? provider
+		: undefined;
 }
 
 function resolveApiProvider(api: Api) {

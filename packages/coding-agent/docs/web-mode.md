@@ -196,6 +196,7 @@ Before creating a runtime, a control plane can read `GET /api/project-trust?cwd=
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/models` | List models for the default session, or for `?session_id=<id>` when supplied. |
+| `GET` | `/api/catalog` | List the complete provider/model catalog for the default runtime, including non-secret authentication capabilities. |
 | `POST` | `/api/sessions/:id/model` | Set the exact model. Body: `{ "provider": "anthropic", "modelId": "claude-sonnet-5" }`. |
 | `POST` | `/api/sessions/:id/cycle-model` | Cycle the model. Optional body: `{ "direction": "forward" }` or `backward`. |
 | `POST` | `/api/sessions/:id/thinking` | Set thinking level. Body: `{ "level": "high" }`. Valid levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`. |
