@@ -21,6 +21,30 @@ import { createDefaultWebSessionManagerFactory, resolveWebModeOptions } from "..
 import { WebSessionHost } from "../src/modes/web/web-session-host.ts";
 import { ConnectionManager, type WebSocketLike } from "../src/modes/web/ws/connection-manager.ts";
 
+interface RuntimeCatalogResponse {
+	schemaVersion: number;
+	providers: Array<{
+		id: string;
+		name: string;
+		baseUrl: string | null;
+		auth: {
+			apiKey: boolean;
+			oauth: boolean;
+			subscription: boolean;
+			configured: boolean;
+		};
+		models: Array<{
+			id: string;
+			name: string;
+			api: string;
+			reasoning: boolean;
+			input: string[];
+			contextWindow: number;
+			maxTokens: number;
+		}>;
+	}>;
+}
+
 describe("web mode server", () => {
 	const cleanups: Array<() => Promise<void> | void> = [];
 
@@ -204,6 +228,78 @@ describe("web mode server", () => {
 		});
 		await once(authorized, "open");
 		authorized.close();
+	});
+
+	it("protects the runtime catalog with the existing HTTP auth middleware", async () => {
+		const { baseUrl } = await createHarness({ authToken: "secret" });
+
+		expect((await fetch(`${baseUrl}/api/catalog`)).status).toBe(401);
+		expect(
+			(
+				await fetch(`${baseUrl}/api/catalog`, {
+					headers: { Authorization: "Bearer wrong" },
+				})
+			).status,
+		).toBe(401);
+		expect(
+			(
+				await fetch(`${baseUrl}/api/catalog`, {
+					headers: { Authorization: "Bearer secret" },
+				})
+			).status,
+		).toBe(200);
+	});
+
+	it("exposes the complete provider catalog without changing available model filtering", async () => {
+		const configured = await createHarness();
+		const catalogResponse = await fetch(`${configured.baseUrl}/api/catalog`);
+
+		expect(catalogResponse.status).toBe(200);
+		const catalog = (await catalogResponse.json()) as RuntimeCatalogResponse;
+		expect(catalog.schemaVersion).toBe(1);
+
+		const fauxProvider = catalog.providers.find((provider) => provider.id === "faux");
+		if (!fauxProvider) throw new Error("missing faux provider in catalog");
+		expect(fauxProvider).toMatchObject({
+			id: "faux",
+			name: "faux",
+			baseUrl: "http://localhost:0",
+			auth: { apiKey: true, oauth: false, subscription: false, configured: true },
+		});
+		expect(fauxProvider.models).toEqual([
+			expect.objectContaining({
+				id: "faux-1",
+				name: expect.any(String),
+				api: expect.any(String),
+				reasoning: true,
+				input: ["text", "image"],
+				contextWindow: 128000,
+				maxTokens: 16384,
+			}),
+		]);
+		expect(JSON.stringify(catalog)).not.toContain("faux-key");
+
+		const availableResponse = await fetch(`${configured.baseUrl}/api/models`);
+		expect(availableResponse.status).toBe(200);
+		const available = (await availableResponse.json()) as Array<{ id: string; provider: string }>;
+		expect(available).toContainEqual(expect.objectContaining({ id: "faux-1", provider: "faux" }));
+
+		const anthropicProvider = catalog.providers.find((provider) => provider.id === "anthropic");
+		if (!anthropicProvider) throw new Error("missing anthropic provider in catalog");
+		expect(anthropicProvider.auth).toMatchObject({ apiKey: true, oauth: true, subscription: true });
+
+		const unconfigured = await createHarness({ configureApiKey: false });
+		const unconfiguredCatalog = (await (
+			await fetch(`${unconfigured.baseUrl}/api/catalog`)
+		).json()) as RuntimeCatalogResponse;
+		const unconfiguredFaux = unconfiguredCatalog.providers.find((provider) => provider.id === "faux");
+		if (!unconfiguredFaux) throw new Error("missing unconfigured faux provider in catalog");
+		expect(unconfiguredFaux.auth.configured).toBe(false);
+		expect(unconfiguredFaux.models).toHaveLength(1);
+
+		const unavailableResponse = await fetch(`${unconfigured.baseUrl}/api/models`);
+		const unavailable = (await unavailableResponse.json()) as Array<{ provider: string }>;
+		expect(unavailable.some((model) => model.provider === "faux")).toBe(false);
 	});
 
 	it("exposes the versioned runtime host contract and distinct runtime identities", async () => {

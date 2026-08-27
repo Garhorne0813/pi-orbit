@@ -231,6 +231,7 @@ Pi Orbit 定位为单用户共享进程运行时宿主。Provider 凭据、`agen
 | `POST` | `/api/sessions/:id/compact` | 压缩上下文并返回压缩结果 |
 | `POST` | `/api/sessions/:id/fork` | 在可选的 `entryId` 处派生会话 |
 | `GET` | `/api/models?session_id=<id>` | 列出已配置认证的模型 |
+| `GET` | `/api/catalog` | 列出默认 Runtime 的完整 Provider/Model 目录及非敏感认证能力 |
 | `POST` | `/api/sessions/:id/model` | 精确选择 `{ "provider": "...", "modelId": "..." }` |
 | `POST` | `/api/sessions/:id/cycle-model` | 向前或向后循环切换模型 |
 | `POST` | `/api/sessions/:id/thinking` | 设置 `off`、`minimal`、`low`、`medium`、`high` 或 `xhigh` |

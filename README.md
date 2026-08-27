@@ -231,6 +231,7 @@ The startup session is protected from deletion. Use its `restart` endpoint when 
 | `POST` | `/api/sessions/:id/compact` | Compact context and return the compaction result |
 | `POST` | `/api/sessions/:id/fork` | Fork at an optional `entryId` |
 | `GET` | `/api/models?session_id=<id>` | List models with configured authentication |
+| `GET` | `/api/catalog` | List the complete provider/model catalog for the default runtime, including non-secret authentication capabilities |
 | `POST` | `/api/sessions/:id/model` | Select `{ "provider": "...", "modelId": "..." }` exactly |
 | `POST` | `/api/sessions/:id/cycle-model` | Cycle models forward or backward |
 | `POST` | `/api/sessions/:id/thinking` | Set `off`, `minimal`, `low`, `medium`, `high`, or `xhigh` |

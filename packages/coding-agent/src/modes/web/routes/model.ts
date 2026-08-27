@@ -18,6 +18,34 @@ export interface ModelRoutesDeps {
 	sessionHost: WebSessionHost;
 }
 
+interface RuntimeCatalogModel {
+	id: string;
+	name: string;
+	api: Api;
+	reasoning: boolean;
+	input: ("text" | "image")[];
+	contextWindow: number;
+	maxTokens: number;
+}
+
+interface RuntimeCatalogProvider {
+	id: string;
+	name: string;
+	baseUrl: string | null;
+	auth: {
+		apiKey: boolean;
+		oauth: boolean;
+		subscription: boolean;
+		configured: boolean;
+	};
+	models: RuntimeCatalogModel[];
+}
+
+interface RuntimeCatalogResponse {
+	schemaVersion: 1;
+	providers: RuntimeCatalogProvider[];
+}
+
 export function registerModelRoutes(app: Hono, deps: ModelRoutesDeps): void {
 	app.get("/api/models", async (context) => {
 		const sessionId = context.req.query("session_id") ?? deps.sessionHost.defaultSessionId;
@@ -34,6 +62,35 @@ export function registerModelRoutes(app: Hono, deps: ModelRoutesDeps): void {
 				maxTokens: model.maxTokens,
 			})),
 		);
+	});
+
+	app.get("/api/catalog", (context) => {
+		const entry = deps.sessionHost.get(deps.sessionHost.defaultRuntimeId);
+		if (!entry) return context.json({ error: "Runtime not found" } as const, 404);
+
+		const modelRuntime = entry.runtime.services.modelRuntime;
+		const providers: RuntimeCatalogProvider[] = modelRuntime.getProviders().map((provider) => ({
+			id: provider.id,
+			name: provider.name,
+			baseUrl: provider.baseUrl ?? null,
+			auth: {
+				apiKey: provider.auth.apiKey !== undefined,
+				oauth: provider.auth.oauth !== undefined,
+				subscription: provider.auth.oauth?.isSubscription === true,
+				configured: modelRuntime.hasConfiguredAuth(provider.id),
+			},
+			models: modelRuntime.getModels(provider.id).map((model) => ({
+				id: model.id,
+				name: model.name,
+				api: model.api,
+				reasoning: model.reasoning,
+				input: [...model.input],
+				contextWindow: model.contextWindow,
+				maxTokens: model.maxTokens,
+			})),
+		}));
+
+		return context.json<RuntimeCatalogResponse>({ schemaVersion: 1, providers });
 	});
 
 	app.post("/api/sessions/:id/model", async (context) => {
