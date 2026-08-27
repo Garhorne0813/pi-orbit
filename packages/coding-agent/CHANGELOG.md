@@ -26,6 +26,7 @@
 - Fixed Web mode session isolation, runtime replacement event rebinding, default-session deletion, session naming, authentication configuration, and prompt response semantics.
 - Fixed runtime prompt rate limiting to use independent runtime buckets.
 - Fixed Cloudflare AI Gateway builds when generated model catalogs omit one of its supported API groups.
+- Fixed the Cloudflare AI Gateway default model to remain available in the generated catalog.
 - Fixed writes to `auth.json` and `models-store.json` overriding administrator-managed file permissions and ACLs ([#7779](https://github.com/earendil-works/pi/issues/7779)).
 - Fixed UTF-8 BOM markers preventing frontmatter and user configuration files from loading ([#8337](https://github.com/earendil-works/pi/issues/8337)).
 - Fixed invalid settings files being easy to miss during interactive startup by rendering warnings with the file path inside the TUI ([#7829](https://github.com/earendil-works/pi/issues/7829)).
