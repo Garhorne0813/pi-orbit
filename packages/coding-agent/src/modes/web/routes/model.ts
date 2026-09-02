@@ -1,6 +1,6 @@
 /** Model and configuration routes for web mode. */
 
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { type Api, getSupportedThinkingLevels, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { Hono } from "hono";
 import type { WebCommandHandler } from "../commands.ts";
 import {
@@ -23,6 +23,7 @@ interface RuntimeCatalogModel {
 	name: string;
 	api: Api;
 	reasoning: boolean;
+	thinkingLevels: ModelThinkingLevel[];
 	input: ("text" | "image")[];
 	contextWindow: number;
 	maxTokens: number;
@@ -57,6 +58,7 @@ export function registerModelRoutes(app: Hono, deps: ModelRoutesDeps): void {
 				name: model.name,
 				provider: model.provider,
 				reasoning: model.reasoning,
+				thinkingLevels: getSupportedThinkingLevels(model),
 				input: model.input,
 				contextWindow: model.contextWindow,
 				maxTokens: model.maxTokens,
@@ -84,6 +86,7 @@ export function registerModelRoutes(app: Hono, deps: ModelRoutesDeps): void {
 				name: model.name,
 				api: model.api,
 				reasoning: model.reasoning,
+				thinkingLevels: getSupportedThinkingLevels(model),
 				input: [...model.input],
 				contextWindow: model.contextWindow,
 				maxTokens: model.maxTokens,
