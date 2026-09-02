@@ -38,6 +38,7 @@ interface RuntimeCatalogResponse {
 			name: string;
 			api: string;
 			reasoning: boolean;
+			thinkingLevels: string[];
 			input: string[];
 			contextWindow: number;
 			maxTokens: number;
@@ -97,6 +98,7 @@ describe("web mode server", () => {
 					name: model.name,
 					api: model.api,
 					reasoning: model.reasoning,
+					thinkingLevelMap: { off: "none", minimal: null, low: null, medium: null, high: "high", max: "max" },
 					input: model.input,
 					cost: model.cost,
 					contextWindow: model.contextWindow,
@@ -272,17 +274,26 @@ describe("web mode server", () => {
 				name: expect.any(String),
 				api: expect.any(String),
 				reasoning: true,
+				thinkingLevels: ["off", "high", "max"],
 				input: ["text", "image"],
 				contextWindow: 128000,
 				maxTokens: 16384,
 			}),
 		]);
+		expect(JSON.stringify(catalog)).not.toContain("thinkingLevelMap");
 		expect(JSON.stringify(catalog)).not.toContain("faux-key");
 
 		const availableResponse = await fetch(`${configured.baseUrl}/api/models`);
 		expect(availableResponse.status).toBe(200);
-		const available = (await availableResponse.json()) as Array<{ id: string; provider: string }>;
-		expect(available).toContainEqual(expect.objectContaining({ id: "faux-1", provider: "faux" }));
+		const available = (await availableResponse.json()) as Array<{
+			id: string;
+			provider: string;
+			thinkingLevels: string[];
+		}>;
+		expect(available).toContainEqual(
+			expect.objectContaining({ id: "faux-1", provider: "faux", thinkingLevels: ["off", "high", "max"] }),
+		);
+		expect(JSON.stringify(available)).not.toContain("thinkingLevelMap");
 
 		const anthropicProvider = catalog.providers.find((provider) => provider.id === "anthropic");
 		if (!anthropicProvider) throw new Error("missing anthropic provider in catalog");
