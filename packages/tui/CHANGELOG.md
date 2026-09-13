@@ -6,6 +6,20 @@
 
 - Removed coding-agent environment-variable defaults from pi-tui. Applications must configure the hardware cursor and clear-on-shrink behavior through the renderer constructor and `setClearOnShrink()`. `PI_DEBUG_REDRAW` is now `PI_TUI_DEBUG_REDRAW`; debug and crash log filenames now use the `pi-tui-` prefix. When no log directory is supplied, redraw logging is disabled and crash dumps are written to the OS temp directory. ([#8699](https://github.com/earendil-works/pi/pull/8699) by [@geraschenko](https://github.com/geraschenko))
 
+### Added
+
+- Added LaTeX rendering for relational algebra join symbols ([#9050](https://github.com/earendil-works/pi/pull/9050) by [@haoqixu](https://github.com/haoqixu)).
+
+### Changed
+
+- Reduced fullscreen transcript search latency on large transcripts by caching unchanged search results, indexing ASCII runs, and limiting highlight work to visible matches ([#8800](https://github.com/earendil-works/pi/pull/8800) by [@cristinaponcela](https://github.com/cristinaponcela)).
+
+### Fixed
+
+- Fixed drag selection continuing over an editor.
+- Fixed terminal startup under restricted seccomp policies that reject the `SIGWINCH` self-signal ([#8898](https://github.com/earendil-works/pi/pull/8898) by [@bartlomiejkida](https://github.com/bartlomiejkida)).
+- Fixed Zed terminal image capability detection ([#8828](https://github.com/earendil-works/pi/pull/8828) by [@Perlence](https://github.com/Perlence)).
+
 ## [0.84.4] - 2026-08-28
 
 ### Added
